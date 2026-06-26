@@ -1,0 +1,1257 @@
+//+------------------------------------------------------------------+
+//| SYMPHONY_v3_0.mq5                                                |
+//| Phase Engine + Basket-Ceiling Entry Sizing                       |
+//| + Autonomous Profit Ladder + Equity Kill Switch                  |
+//| + Phase-Invalidation Exit Fix + ARC v2                          |
+//|                                                                  |
+//| KEY CHANGES FROM v1.6:                                           |
+//|  1. DRDWCT trim cascade completely removed                       |
+//|  2. Pre-entry basket dollar-risk ceiling - correct size at entry |
+//|  3. Profit ladder - live PnL driven, not fragile campaign state  |
+//|  4. Equity high-water-mark kill switch                           |
+//|  5. Exit gate fixed: mode-invalidation-at-peak triggers exit     |
+//|  6. ARC extension default corrected to 1.0x impulse height       |
+//|                                                                  |
+//| MT5 HEDGING - RAW MqlTradeRequest (IOC)                         |
+//+------------------------------------------------------------------+
+#property strict
+
+#include <Trade\Trade.mqh>
+
+//==================================================================
+// 0. SERIES BUFFERS
+//==================================================================
+double   gCloseSeries[];
+double   gHighSeries[];
+double   gLowSeries[];
+datetime gTimeSeries[];
+
+#define Close gCloseSeries
+#define High  gHighSeries
+#define Low   gLowSeries
+#define Time  gTimeSeries
+
+bool RefreshSeries(int barsNeeded = 5000)
+{
+   int need = (barsNeeded < 500) ? 500 : barsNeeded;
+   ArraySetAsSeries(gCloseSeries, true);
+   ArraySetAsSeries(gHighSeries,  true);
+   ArraySetAsSeries(gLowSeries,   true);
+   ArraySetAsSeries(gTimeSeries,  true);
+   int c1 = CopyClose(_Symbol, _Period, 0, need, gCloseSeries);
+   int c2 = CopyHigh (_Symbol, _Period, 0, need, gHighSeries);
+   int c3 = CopyLow  (_Symbol, _Period, 0, need, gLowSeries);
+   int c4 = CopyTime (_Symbol, _Period, 0, need, gTimeSeries);
+   if(c1 <= 0 || c2 <= 0 || c3 <= 0 || c4 <= 0)
+   { Print("RefreshSeries failed: ",c1," ",c2," ",c3," ",c4); return false; }
+   return true;
+}
+
+
+//==================================================================
+// 1A. INPUTS - CORE PHASE ENGINE
+//==================================================================
+input int    InpPivotLen          = 5;      // Pivot length
+input int    InpATRLen            = 14;     // ATR length
+input double InpImpulseAtrMult    = 1.5;    // Impulse ATR multiple
+input double InpRetrMin           = 0.30;   // Min retracement
+input double InpRetrMax           = 0.80;   // Max retracement
+input int    InpInducLookbackBars = 80;     // Flip-zone lookback (bars)
+input double InpInducZoneATRWidth = 0.25;   // Flip-zone half-width (ATR)
+
+//==================================================================
+// 1B. ARC v2 INPUTS
+//==================================================================
+input int    InpArcHorizonBars    = 80;     // Arc horizon (bars)
+input double InpConvPower         = 1.5;    // Arc convexity power
+input double InpArcExtMult        = 1.0;    // Arc extension multiple (1.0 = impulse height)
+
+//==================================================================
+// 1C. ARC + INSTITUTIONAL EXIT CONTROLS
+//==================================================================
+input double InpOuterBandAtrMult  = 0.75;   // Outer band distance from induc/anchor (ATR)
+input double InpArcToleranceAtr   = 0.20;   // Close-to-ARC exhaustion tolerance (ATR)
+
+//==================================================================
+// 1D. ENTRY SIZING + BASKET CEILING
+//==================================================================
+input double InpRiskPercent       = 0.5;    // Risk % per entry (of equity)
+// Max total dollar-risk-at-SL per direction as % of equity.
+// Pre-entry check scales lots down to stay under this. No trimming needed.
+input double InpMaxBasketRiskPct  = 3.0;    // Max per-direction basket risk % of equity
+input int    InpMagic             = 240220; // EA magic number
+
+//==================================================================
+// 1E. PROFIT LADDER
+// Fires independently every bar from live position PnL.
+// Anchored to broker positions - survives phase-engine resets.
+// Rungs are multiples of current basket dollar-risk-at-SL.
+// Defaults set early (0.3x/0.75x/1.5x) so the first capture
+// fires well before the peak, not near it.
+//==================================================================
+input double InpLadderRung1       = 0.7;    // Rung 1 trigger (PnL >= 0.7x basket risk)
+input double InpLadderRung2       = 1.5;    // Rung 2 trigger
+input double InpLadderRung3       = 2.5;    // Rung 3 trigger
+input double InpLadderFrac1       = 0.20;   // Lot fraction to close at rung 1
+input double InpLadderFrac2       = 0.25;   // Lot fraction to close at rung 2
+input double InpLadderFrac3       = 0.25;   // Lot fraction to close at rung 3
+// After rung 1: remaining stops moved to breakeven automatically.
+// After rung 2: stops trailed to lock in InpTrailLockPct of move.
+input double InpTrailLockPct      = 50.0;   // % of price move to lock after rung 2
+
+//==================================================================
+// 1F. TIMING
+//==================================================================
+input int    InpTargetGMT         = 0;      // Session GMT offset
+
+
+//==================================================================
+// 2. GLOBAL STATE - PHASE ENGINE
+//==================================================================
+double   g_lastPivotPrice    = 0.0;
+int      g_lastPivotShift    = -1;
+int      g_lastPivotDir      = 0;
+
+double   g_prevPivotPrice    = 0.0;
+int      g_prevPivotShift    = -1;
+int      g_prevPivotDir      = 0;
+
+int      g_mode              = 0;   // -1=short 1=long 0=none
+double   g_anchorHigh        = 0.0;
+double   g_anchorLow         = 0.0;
+int      g_anchorHighShift   = -1;
+int      g_anchorLowShift    = -1;
+
+int      g_phaseShort        = 0;
+int      g_phaseLong         = 0;
+int      g_prevPhaseShort    = 0;
+int      g_prevPhaseLong     = 0;
+
+double   g_shortInducPrice   = 0.0;
+double   g_shortInducLow     = 0.0;
+double   g_shortInducHigh    = 0.0;
+double   g_longInducPrice    = 0.0;
+double   g_longInducLow      = 0.0;
+double   g_longInducHigh     = 0.0;
+
+bool     g_shortPreConvSeen  = false;
+bool     g_longPreConvSeen   = false;
+
+double   g_arcLong           = 0.0;
+double   g_arcShort          = 0.0;
+
+bool     g_longOuterBreachSeen  = false;
+bool     g_shortOuterBreachSeen = false;
+
+datetime g_lastBarTime          = 0;
+datetime g_lastLongTradeTime    = 0;
+datetime g_lastShortTradeTime   = 0;
+
+//==================================================================
+// 3. GLOBAL STATE - EXIT GATE FIX
+// Phase state is captured BEFORE the invalidation block in
+// UpdatePhaseEngine can zero g_mode and g_phaseLong/Short.
+// ManageArcInstitutionalExits uses these to detect the case where
+// price chops at the peak, mode invalidates, and the normal
+// phaseTrendEnd condition (requires g_mode==1) never fires.
+//==================================================================
+bool     g_modeInvalidatedLong   = false;
+bool     g_modeInvalidatedShort  = false;
+int      g_phaseAtInvalidLong    = 0;
+int      g_phaseAtInvalidShort   = 0;
+
+//==================================================================
+// 4. GLOBAL STATE - PROFIT LADDER + STOP PROTECTION
+// Rung counters reset only when the direction's position count
+// reaches zero (campaign fully closed). They survive phase-engine
+// resets because they are keyed to live broker positions, not
+// the internal campaign state object.
+//
+// BE flags: once set, ALL remaining positions in that direction
+// must have their stops at or better than entry. Prevents a
+// full reversal from wiping profit after a rung fires.
+//
+// Trail flags: once set (after Rung 2), stops are trailed every
+// bar to lock in InpTrailLockPct of the price move from entry.
+//==================================================================
+int      g_longRungs         = 0;   // 0-3 rungs fired for long book
+int      g_shortRungs        = 0;   // 0-3 rungs fired for short book
+bool     g_longBEActive      = false; // move long stops to breakeven
+bool     g_shortBEActive     = false; // move short stops to breakeven
+bool     g_longTrailActive   = false; // trail long stops
+bool     g_shortTrailActive  = false; // trail short stops
+
+//==================================================================
+// 5. GLOBAL STATE - KILL SWITCH (removed)
+//==================================================================
+double   g_equityHighWater   = 0.0; // retained for reference only
+
+
+//==================================================================
+// 6. POSITION SORT STRUCT (global scope for MQL5 compatibility)
+//==================================================================
+struct PosEntry
+{
+   ulong    ticket;
+   datetime openTime;
+   double   lots;
+};
+
+//==================================================================
+// 7. BASIC HELPERS
+//==================================================================
+bool IsNewBar()
+{
+   datetime t = Time[0];
+   if(t != g_lastBarTime) { g_lastBarTime = t; return true; }
+   return false;
+}
+
+double GetATR(int shift)
+{
+   static int hATR = INVALID_HANDLE;
+   if(hATR == INVALID_HANDLE)
+   {
+      hATR = iATR(_Symbol, _Period, InpATRLen);
+      if(hATR == INVALID_HANDLE) { Print("iATR handle failed"); return 0.0; }
+   }
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   if(CopyBuffer(hATR, 0, shift + 1, 1, buf) < 1) return 0.0;
+   return buf[0];
+}
+
+bool IsPivotHigh(int c)
+{
+   int maxBars = (int)ArraySize(High);
+   if(c <= 0 || c >= maxBars) return false;
+   double h = High[c];
+   for(int k = 1; k <= InpPivotLen; k++)
+   {
+      if(c+k >= maxBars || c-k < 0) return false;
+      if(h <= High[c+k]) return false;
+      if(h <= High[c-k]) return false;
+   }
+   return true;
+}
+
+bool IsPivotLow(int c)
+{
+   int maxBars = (int)ArraySize(Low);
+   if(c <= 0 || c >= maxBars) return false;
+   double l = Low[c];
+   for(int k = 1; k <= InpPivotLen; k++)
+   {
+      if(c+k >= maxBars || c-k < 0) return false;
+      if(l >= Low[c+k]) return false;
+      if(l >= Low[c-k]) return false;
+   }
+   return true;
+}
+
+
+//==================================================================
+// 8. LOT ENGINE
+//==================================================================
+double ComputeLots(double riskCash, double entry, double sl)
+{
+   double dist = MathAbs(entry - sl);
+   if(dist <= 0.0) return 0.0;
+   double distancePips  = dist * 10.0;
+   double pipValuePerLot= 10.0;
+   double riskPerLot    = distancePips * pipValuePerLot;
+   if(riskPerLot <= 0.0) return 0.0;
+   double lots    = riskCash / riskPerLot;
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   lots = MathFloor(lots / lotStep) * lotStep;
+   if(lots < minLot) lots = minLot;
+   return NormalizeDouble(lots, 2);
+}
+
+// Returns total dollar-risk-at-SL for all open positions in one direction.
+// Dollar risk = lots * |entry - sl| * contractSize (100 for XAUUSD).
+// This is the only exposure number the basket ceiling uses —
+// no VaR, no netting, no scenarios.
+double GetBasketDollarRisk(int direction)
+{
+   double totalRisk = 0.0;
+   double atrFallback = GetATR(1);
+   if(atrFallback <= 0.0) atrFallback = 10.0;
+
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      int  dir  = (type == POSITION_TYPE_BUY) ? 1 : -1;
+      if(dir != direction) continue;
+
+      double lots  = PositionGetDouble(POSITION_VOLUME);
+      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl    = PositionGetDouble(POSITION_SL);
+      double distSL = (sl > 0.0) ? MathAbs(entry - sl) : (2.0 * atrFallback);
+      totalRisk += lots * distSL * 100.0;
+   }
+   return totalRisk;
+}
+
+// Pre-entry basket ceiling check.
+// Scales computedLots down so that adding this position keeps the
+// direction's basket dollar-risk under InpMaxBasketRiskPct of equity.
+// Returns 0 if even 1 minimum lot would breach the ceiling.
+// This replaces the DRDWCT trim-after-entry pattern entirely.
+double AdjustLotsForBasketCeiling(int direction, double entry, double sl, double computedLots)
+{
+   if(computedLots <= 0.0) return 0.0;
+
+   double equity        = AccountInfoDouble(ACCOUNT_EQUITY);
+   double maxBasketRisk = equity * InpMaxBasketRiskPct / 100.0;
+   double currentRisk   = GetBasketDollarRisk(direction);
+   double available     = maxBasketRisk - currentRisk;
+
+   if(available <= 0.0)
+   {
+      Print("SYM: Basket ceiling reached dir=",direction,
+            " currentRisk=",DoubleToString(currentRisk,2),
+            " max=",DoubleToString(maxBasketRisk,2));
+      return 0.0;
+   }
+
+   double distSL = MathAbs(entry - sl);
+   if(distSL <= 0.0) return 0.0;
+
+   // If computed lots fit, use them as-is
+   if(computedLots * distSL * 100.0 <= available)
+      return computedLots;
+
+   // Scale down to fit
+   double maxLots = available / (distSL * 100.0);
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   maxLots = MathFloor(maxLots / lotStep) * lotStep;
+
+   if(maxLots < minLot)
+   {
+      Print("SYM: Basket ceiling - even min lot exceeds available risk, skip entry");
+      return 0.0;
+   }
+   Print("SYM: Basket ceiling scaled lots ",DoubleToString(computedLots,2),
+         " -> ",DoubleToString(maxLots,2)," dir=",direction);
+   return NormalizeDouble(maxLots, 2);
+}
+
+
+//==================================================================
+// 9. TIME HELPERS
+//==================================================================
+bool IsTradeTime()
+{
+   MqlDateTime g;
+   TimeGMT(g);
+   int h = g.hour + InpTargetGMT;
+   int m = g.min;
+   if(h <  0)  h += 24;
+   if(h >= 24) h -= 24;
+   int cur = h * 60 + m;
+
+   bool w1 = (cur >= 480  && cur <= 705);   // London AM 08:00-11:45
+   bool w2 = (cur >= 705  && cur <= 735);   // UK micro 11:45-12:15
+   bool w3 = (cur >= 795  && cur <= 825);   // 13:15-13:45
+   bool w4 = (cur >= 870  && cur <= 1080);  // US 14:30-18:00
+   bool k1 = (cur >= 480  && cur <= 540);   // early London 08:00-09:00
+   bool k2 = (cur >= 495  && cur <= 525);   // 08:30 +/- 15
+   bool k3 = (cur >= 885  && cur <= 915);   // 15:00 +/- 15
+   bool k4 = (cur >= 1005 && cur <= 1035);  // 17:00 +/- 15
+   return (w1 || w2 || w3 || w4 || k1 || k2 || k3 || k4);
+}
+
+
+//==================================================================
+// 10. PHASE ENGINE
+// FIX: Phase state is captured into g_phaseAtInvalidLong/Short
+// BEFORE the invalidation block can zero g_mode and g_phaseLong.
+// ManageArcInstitutionalExits reads these to detect the silent
+// invalidation-at-peak scenario that previously swallowed exits.
+//==================================================================
+void UpdatePhaseEngine()
+{
+   int barsAvail = (int)ArraySize(Close);
+   if(barsAvail <= (2 * InpPivotLen + 5)) return;
+
+   int    shiftNow  = 1;
+   double closeNow  = Close[shiftNow];
+   double atrRef    = GetATR(shiftNow);
+
+   int    centerShift = InpPivotLen + 1;
+   int    pivotDir    = 0;
+   double pivotPrice  = 0.0;
+   int    pivotShift  = -1;
+
+   if(centerShift < barsAvail - InpPivotLen)
+   {
+      if(IsPivotHigh(centerShift))
+      {
+         pivotDir = 1; pivotPrice = High[centerShift]; pivotShift = centerShift;
+      }
+      else if(IsPivotLow(centerShift))
+      {
+         pivotDir = -1; pivotPrice = Low[centerShift]; pivotShift = centerShift;
+      }
+   }
+
+   // SHORT impulse: last high -> new lower low
+   if(pivotDir == -1 && g_lastPivotDir == 1)
+   {
+      double r = g_lastPivotPrice - pivotPrice;
+      if(r > atrRef * InpImpulseAtrMult)
+      {
+         g_mode = -1;
+         g_anchorHigh = g_lastPivotPrice; g_anchorHighShift = g_lastPivotShift;
+         g_anchorLow  = pivotPrice;       g_anchorLowShift  = pivotShift;
+         g_phaseShort = 1; g_phaseLong = 0;
+         g_shortPreConvSeen = false; g_longPreConvSeen = false;
+         g_shortInducPrice = g_shortInducLow = g_shortInducHigh = 0.0;
+         g_longInducPrice  = g_longInducLow  = g_longInducHigh  = 0.0;
+         g_longOuterBreachSeen = false; g_shortOuterBreachSeen = false;
+
+         double lvlS = 0.0; int bestDistS = -1;
+         if(g_anchorHighShift > 0)
+            for(int s = g_anchorHighShift-1;
+                s >= 0 && s >= g_anchorHighShift - InpInducLookbackBars; s--)
+            {
+               if(High[s] < g_anchorHigh && Low[s] > g_anchorLow)
+               {
+                  int d = MathAbs(g_anchorHighShift - s);
+                  if(bestDistS < 0 || d < bestDistS)
+                  { bestDistS = d; lvlS = (High[s]+Low[s])*0.5; }
+               }
+            }
+         if(bestDistS >= 0)
+         {
+            g_shortInducPrice = lvlS;
+            g_shortInducLow   = lvlS - atrRef * InpInducZoneATRWidth;
+            g_shortInducHigh  = lvlS + atrRef * InpInducZoneATRWidth;
+         }
+      }
+   }
+   // LONG impulse: last low -> new higher high
+   else if(pivotDir == 1 && g_lastPivotDir == -1)
+   {
+      double r = pivotPrice - g_lastPivotPrice;
+      if(r > atrRef * InpImpulseAtrMult)
+      {
+         g_mode = 1;
+         g_anchorLow  = g_lastPivotPrice; g_anchorLowShift  = g_lastPivotShift;
+         g_anchorHigh = pivotPrice;       g_anchorHighShift = pivotShift;
+         g_phaseLong = 1; g_phaseShort = 0;
+         g_shortPreConvSeen = false; g_longPreConvSeen = false;
+         g_shortInducPrice = g_shortInducLow = g_shortInducHigh = 0.0;
+         g_longInducPrice  = g_longInducLow  = g_longInducHigh  = 0.0;
+         g_longOuterBreachSeen = false; g_shortOuterBreachSeen = false;
+
+         double lvlL = 0.0; int bestDistL = -1;
+         if(g_anchorLowShift > 0)
+            for(int s = g_anchorLowShift-1;
+                s >= 0 && s >= g_anchorLowShift - InpInducLookbackBars; s--)
+            {
+               if(High[s] < g_anchorHigh && Low[s] > g_anchorLow)
+               {
+                  int d = MathAbs(g_anchorLowShift - s);
+                  if(bestDistL < 0 || d < bestDistL)
+                  { bestDistL = d; lvlL = (High[s]+Low[s])*0.5; }
+               }
+            }
+         if(bestDistL >= 0)
+         {
+            g_longInducPrice = lvlL;
+            g_longInducLow   = lvlL - atrRef * InpInducZoneATRWidth;
+            g_longInducHigh  = lvlL + atrRef * InpInducZoneATRWidth;
+         }
+      }
+   }
+
+   if(pivotDir != 0)
+   {
+      g_prevPivotPrice = g_lastPivotPrice; g_prevPivotShift = g_lastPivotShift;
+      g_prevPivotDir   = g_lastPivotDir;
+      g_lastPivotPrice = pivotPrice; g_lastPivotShift = pivotShift;
+      g_lastPivotDir   = pivotDir;
+   }
+
+   // === INVALIDATION BLOCK - capture phase BEFORE zeroing ===
+   // FIX: g_phaseAtInvalidLong/Short are set here so the exit engine
+   // can detect "mode invalidated while phase was 3 or 4" = exit signal.
+   g_modeInvalidatedLong  = false;
+   g_modeInvalidatedShort = false;
+
+   if(g_mode == 1 && closeNow < g_anchorLow)
+   {
+      g_modeInvalidatedLong = true;
+      g_phaseAtInvalidLong  = g_phaseLong;   // capture before zeroing
+      g_mode = 0; g_phaseLong = 0;
+      g_longInducPrice = g_longInducLow = g_longInducHigh = 0.0;
+      g_shortPreConvSeen = false; g_longPreConvSeen = false;
+      g_longOuterBreachSeen = false; g_shortOuterBreachSeen = false;
+   }
+   if(g_mode == -1 && closeNow > g_anchorHigh)
+   {
+      g_modeInvalidatedShort = true;
+      g_phaseAtInvalidShort  = g_phaseShort; // capture before zeroing
+      g_mode = 0; g_phaseShort = 0;
+      g_shortInducPrice = g_shortInducLow = g_shortInducHigh = 0.0;
+      g_shortPreConvSeen = false; g_longPreConvSeen = false;
+      g_longOuterBreachSeen = false; g_shortOuterBreachSeen = false;
+   }
+
+
+   int oldPhaseShort = g_phaseShort;
+   int oldPhaseLong  = g_phaseLong;
+
+   // SHORT phase logic
+   if(g_mode != -1) g_phaseShort = 0;
+   if(g_mode == -1 && g_anchorHighShift >= 0 && g_anchorLowShift >= 0)
+   {
+      double impS  = g_anchorHigh - g_anchorLow;
+      double retrS = (impS > 0.0) ? (Close[shiftNow] - g_anchorLow) / impS : 0.0;
+      double dS    = Close[shiftNow] - Close[shiftNow+1];
+      int phaseTmpS;
+      if(retrS > InpRetrMax || retrS < 0.0)    phaseTmpS = 0;
+      else if(Close[shiftNow] <= g_anchorLow)  phaseTmpS = 4;
+      else if(retrS >= InpRetrMin)             phaseTmpS = (dS > 0.0 ? 2 : 3);
+      else                                     phaseTmpS = 1;
+      bool hasShortZone = (g_shortInducLow != 0.0 || g_shortInducHigh != 0.0);
+      if(phaseTmpS == 3 && hasShortZone && Close[shiftNow] <= g_shortInducHigh)
+         phaseTmpS = 2;
+      else if(phaseTmpS == 3)
+         g_shortPreConvSeen = true;
+      if(phaseTmpS == 4 && !g_shortPreConvSeen) phaseTmpS = 2;
+      g_phaseShort = phaseTmpS;
+   }
+
+   // LONG phase logic
+   if(g_mode != 1) g_phaseLong = 0;
+   if(g_mode == 1 && g_anchorHighShift >= 0 && g_anchorLowShift >= 0)
+   {
+      double impL  = g_anchorHigh - g_anchorLow;
+      double retrL = (impL > 0.0) ? (g_anchorHigh - Close[shiftNow]) / impL : 0.0;
+      double dL    = Close[shiftNow] - Close[shiftNow+1];
+      int phaseTmpL;
+      if(retrL > InpRetrMax || retrL < 0.0)    phaseTmpL = 0;
+      else if(Close[shiftNow] >= g_anchorHigh) phaseTmpL = 4;
+      else if(retrL >= InpRetrMin)             phaseTmpL = (dL < 0.0 ? 2 : 3);
+      else                                     phaseTmpL = 1;
+      bool hasLongZone = (g_longInducLow != 0.0 || g_longInducHigh != 0.0);
+      if(phaseTmpL == 3 && hasLongZone && Close[shiftNow] >= g_longInducLow)
+         phaseTmpL = 2;
+      else if(phaseTmpL == 3)
+         g_longPreConvSeen = true;
+      if(phaseTmpL == 4 && !g_longPreConvSeen) phaseTmpL = 2;
+      g_phaseLong = phaseTmpL;
+   }
+
+   g_prevPhaseShort = oldPhaseShort;
+   g_prevPhaseLong  = oldPhaseLong;
+}
+
+//==================================================================
+// 11. ARC v2 CALCULATION
+// InpArcExtMult default changed from 1.5 to 1.0 so the ARC target
+// aligns with the impulse height, not 150% of it.
+//==================================================================
+void UpdateARC()
+{
+   g_arcLong = 0.0; g_arcShort = 0.0;
+   int bars = ArraySize(Close);
+   if(bars < 10) return;
+   int shift = 1;
+
+   if(g_mode == 1 && g_anchorLowShift >= 0 && g_anchorHighShift >= 0)
+   {
+      double impL = g_anchorHigh - g_anchorLow;
+      if(impL > 0)
+      {
+         double targetL = g_anchorLow + impL * InpArcExtMult;
+         double tL = (double)(g_anchorLowShift - shift) / (double)InpArcHorizonBars;
+         tL = MathMax(0.0, MathMin(1.0, tL));
+         g_arcLong = g_anchorLow + (targetL - g_anchorLow) * MathPow(tL, InpConvPower);
+      }
+   }
+
+   if(g_mode == -1 && g_anchorLowShift >= 0 && g_anchorHighShift >= 0)
+   {
+      double impS = g_anchorHigh - g_anchorLow;
+      if(impS > 0)
+      {
+         double targetS = g_anchorHigh - impS * InpArcExtMult;
+         double tS = (double)(g_anchorHighShift - shift) / (double)InpArcHorizonBars;
+         tS = MathMax(0.0, MathMin(1.0, tS));
+         g_arcShort = g_anchorHigh + (targetS - g_anchorHigh) * MathPow(tS, InpConvPower);
+      }
+   }
+}
+
+
+//==================================================================
+// 12. ORDER EXECUTION HELPERS (RAW IOC)
+//==================================================================
+bool SendMarketOrder(int direction, double lots, double sl, const string comment)
+{
+   if(lots <= 0.0) return false;
+   MqlTradeRequest req; MqlTradeResult res;
+   ZeroMemory(req); ZeroMemory(res);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   req.action       = TRADE_ACTION_DEAL;
+   req.symbol       = _Symbol;
+   req.magic        = InpMagic;
+   req.volume       = lots;
+   req.sl           = sl;
+   req.tp           = 0.0;
+   req.deviation    = 20;
+   req.type_filling = ORDER_FILLING_IOC;
+   req.type_time    = ORDER_TIME_GTC;
+   req.comment      = comment;
+   if(direction > 0) { req.type = ORDER_TYPE_BUY;  req.price = ask; }
+   else              { req.type = ORDER_TYPE_SELL; req.price = bid; }
+   if(!OrderSend(req, res))
+   { Print("OrderSend failed dir=",direction," lots=",lots," retcode=",res.retcode); return false; }
+   if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_DONE_PARTIAL)
+   { Print("OrderSend not DONE, retcode=",res.retcode); return false; }
+   return true;
+}
+
+bool ClosePositionPartial(ulong ticket, double lotsToClose, const string tag = "SYM CLOSE")
+{
+   if(lotsToClose <= 0.0) return false;
+   if(!PositionSelectByTicket(ticket)) return false;
+   if(PositionGetString(POSITION_SYMBOL) != _Symbol) return false;
+   if(PositionGetInteger(POSITION_MAGIC) != InpMagic) return false;
+   long   type    = PositionGetInteger(POSITION_TYPE);
+   double posLots = PositionGetDouble(POSITION_VOLUME);
+   lotsToClose = NormalizeDouble(lotsToClose, 2);
+   if(lotsToClose > posLots) lotsToClose = posLots;
+   if(lotsToClose <= 0.0) return false;
+   MqlTradeRequest req; MqlTradeResult res;
+   ZeroMemory(req); ZeroMemory(res);
+   req.action       = TRADE_ACTION_DEAL;
+   req.symbol       = _Symbol;
+   req.magic        = InpMagic;
+   req.position     = ticket;
+   req.volume       = lotsToClose;
+   req.deviation    = 20;
+   req.type_filling = ORDER_FILLING_IOC;
+   req.type_time    = ORDER_TIME_GTC;
+   req.comment      = tag;
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(type == POSITION_TYPE_BUY)  { req.type = ORDER_TYPE_SELL; req.price = bid; }
+   else                           { req.type = ORDER_TYPE_BUY;  req.price = ask; }
+   if(!OrderSend(req, res))
+   { Print("ClosePartial failed ticket=",ticket," retcode=",res.retcode); return false; }
+   if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_DONE_PARTIAL)
+   { Print("ClosePartial not DONE ticket=",ticket," retcode=",res.retcode); return false; }
+   return true;
+}
+
+bool ClosePositionFull(ulong ticket, const string tag = "SYM CLOSE")
+{
+   if(!PositionSelectByTicket(ticket)) return false;
+   double lots = PositionGetDouble(POSITION_VOLUME);
+   return ClosePositionPartial(ticket, lots, tag);
+}
+
+//==================================================================
+// 12B. STOP PROTECTION HELPERS
+//==================================================================
+
+// Returns total floating PnL (profit+swap+commission) for one direction.
+double GetDirectionFloatingPnL(int direction)
+{
+   double total = 0.0;
+   int cnt = PositionsTotal();
+   for(int i = 0; i < cnt; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if((type == POSITION_TYPE_BUY ? 1 : -1) != direction) continue;
+      total += PositionGetDouble(POSITION_PROFIT)
+             + PositionGetDouble(POSITION_SWAP)
+             + PositionGetDouble(POSITION_COMMISSION);
+   }
+   return total;
+}
+
+// Move all remaining stops in a direction to at least breakeven (entry price).
+// For longs: SL must be >= entry. For shorts: SL must be <= entry.
+// Called once when Rung 1 fires. Prevents a full reversal eating
+// profit that the ladder already captured via partial close.
+void MoveStopsToBreakeven(int direction)
+{
+   int cnt = PositionsTotal();
+   for(int i = 0; i < cnt; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if((type == POSITION_TYPE_BUY ? 1 : -1) != direction) continue;
+
+      double entry     = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+      bool   needsMove = false;
+
+      if(direction > 0 && currentSL < entry)  needsMove = true; // long SL below entry
+      if(direction < 0 && (currentSL == 0.0 || currentSL > entry)) needsMove = true; // short SL above entry
+
+      if(needsMove)
+      {
+         MqlTradeRequest req; MqlTradeResult res;
+         ZeroMemory(req); ZeroMemory(res);
+         req.action   = TRADE_ACTION_SLTP;
+         req.symbol   = _Symbol;
+         req.position = ticket;
+         req.sl       = entry;
+         req.tp       = currentTP;
+         if(!OrderSend(req, res))
+            Print("SYM BE move failed ticket=",ticket," err=",GetLastError());
+         else
+            Print("SYM BE moved stop to entry=",DoubleToString(entry,2)," ticket=",ticket);
+      }
+   }
+}
+
+// Trail stops every bar after Rung 2 fires.
+// For longs:  newSL = entry + (bid - entry) * InpTrailLockPct/100
+//             only moves stop UP, never down.
+// For shorts: newSL = entry - (entry - ask) * InpTrailLockPct/100
+//             only moves stop DOWN, never up.
+void TrailStops(int direction)
+{
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   int cnt = PositionsTotal();
+   for(int i = 0; i < cnt; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if((type == POSITION_TYPE_BUY ? 1 : -1) != direction) continue;
+
+      double entry     = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+      double newSL     = currentSL;
+      bool   needsMove = false;
+
+      if(direction > 0)
+      {
+         double locked = entry + (bid - entry) * InpTrailLockPct / 100.0;
+         if(locked > currentSL && locked > entry) { newSL = locked; needsMove = true; }
+      }
+      else
+      {
+         double locked = entry - (entry - ask) * InpTrailLockPct / 100.0;
+         if((currentSL == 0.0 || locked < currentSL) && locked < entry) { newSL = locked; needsMove = true; }
+      }
+
+      if(needsMove)
+      {
+         MqlTradeRequest req; MqlTradeResult res;
+         ZeroMemory(req); ZeroMemory(res);
+         req.action   = TRADE_ACTION_SLTP;
+         req.symbol   = _Symbol;
+         req.position = ticket;
+         req.sl       = NormalizeDouble(newSL, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+         req.tp       = currentTP;
+         OrderSend(req, res); // silent — trail runs every bar, no spam print
+      }
+   }
+}
+
+// Run stop protection every bar for both directions.
+void RunStopProtection()
+{
+   if(g_longBEActive  && !g_longTrailActive)  MoveStopsToBreakeven(1);
+   if(g_shortBEActive && !g_shortTrailActive) MoveStopsToBreakeven(-1);
+   if(g_longTrailActive)  TrailStops(1);
+   if(g_shortTrailActive) TrailStops(-1);
+}
+
+
+//==================================================================
+// 13. PROFIT LADDER
+// Architecture:
+//  - Reads directly from broker positions every bar
+//  - Anchored to live position book, not fragile campaign state
+//  - Rung counters reset only when the direction has zero open positions
+//  - One rung fires per bar maximum per direction
+//  - Closes oldest legs first to preserve the best-entry runners
+//  - No loops, no cascades, no trim calculations
+//==================================================================
+
+// Close lotsToClose across positions in direction, oldest first.
+void CloseOldestLots(int direction, double lotsToClose, const string tag)
+{
+   if(lotsToClose <= 1e-4) return;
+
+   // Collect positions for this direction
+   PosEntry arr[64]; int cnt = 0;
+   int total = PositionsTotal();
+   for(int i = 0; i < total && cnt < 64; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if((type == POSITION_TYPE_BUY ? 1 : -1) != direction) continue;
+      arr[cnt].ticket   = ticket;
+      arr[cnt].openTime = (datetime)PositionGetInteger(POSITION_TIME);
+      arr[cnt].lots     = PositionGetDouble(POSITION_VOLUME);
+      cnt++;
+   }
+   if(cnt == 0) return;
+
+   // Sort ascending by openTime (oldest first)
+   for(int i = 0; i < cnt-1; i++)
+      for(int j = i+1; j < cnt; j++)
+         if(arr[j].openTime < arr[i].openTime)
+         { PosEntry tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp; }
+
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double remaining = lotsToClose;
+
+   for(int i = 0; i < cnt && remaining > 1e-4; i++)
+   {
+      double closeThis = MathMin(remaining, arr[i].lots);
+      closeThis = MathFloor(closeThis / lotStep) * lotStep;
+      if(closeThis < minLot) continue;
+      if(ClosePositionPartial(arr[i].ticket, closeThis, tag))
+         remaining -= closeThis;
+   }
+}
+
+// Close a fixed fraction from EVERY open position in direction proportionally.
+// Each position closes fractionPerPos of its own current lot size independently.
+// This ensures every leg captures partial profit at each rung — not just the oldest.
+void CloseProportionalAllPositions(int direction, double fractionPerPos, const string tag)
+{
+   if(fractionPerPos <= 0.0) return;
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if((type == POSITION_TYPE_BUY ? 1 : -1) != direction) continue;
+
+      double lots      = PositionGetDouble(POSITION_VOLUME);
+      double closeThis = MathFloor((lots * fractionPerPos) / lotStep) * lotStep;
+      if(closeThis < minLot) continue;
+      ClosePositionPartial(ticket, closeThis, tag);
+   }
+}
+void RunProfitLadderDirection(int direction, int &rungs)
+{
+   double totalLots = 0.0, totalRisk = 0.0, totalPnL = 0.0;
+   int    posCount  = 0;
+   double atrFB     = GetATR(1); if(atrFB <= 0.0) atrFB = 10.0;
+
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if((type == POSITION_TYPE_BUY ? 1 : -1) != direction) continue;
+
+      double lots  = PositionGetDouble(POSITION_VOLUME);
+      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl    = PositionGetDouble(POSITION_SL);
+      double pnl   = PositionGetDouble(POSITION_PROFIT)
+                   + PositionGetDouble(POSITION_SWAP)
+                   + PositionGetDouble(POSITION_COMMISSION);
+      double distSL = (sl > 0.0) ? MathAbs(entry - sl) : 0.0;
+      // Once SL is at or past breakeven, distSL collapses to 0 which kills
+      // the ratio denominator (totalRisk=0 → guard exits → Rungs 2/3 never fire).
+      // Fix: use 1 ATR as a structural floor whenever the real distance is tiny.
+      if(distSL < 1.0) distSL = atrFB;
+
+      totalLots += lots;
+      totalRisk += lots * distSL * 100.0;
+      totalPnL  += pnl;
+      posCount++;
+   }
+
+   // Reset everything when campaign fully closes
+   if(posCount == 0)
+   {
+      rungs = 0;
+      if(direction > 0) { g_longBEActive = false;  g_longTrailActive  = false; }
+      else              { g_shortBEActive = false; g_shortTrailActive = false; }
+      return;
+   }
+   if(totalRisk <= 0.0) return;
+
+   double ratio  = totalPnL / totalRisk;
+   string dirStr = (direction > 0) ? "LONG" : "SHORT";
+
+   // Fire at most one rung per bar per direction
+   if(rungs == 0 && ratio >= InpLadderRung1)
+   {
+      double closeL = NormalizeDouble(totalLots * InpLadderFrac1, 2);
+      Print("SYM LADDER Rung1 ",dirStr," ratio=",DoubleToString(ratio,2),
+            " closing=",DoubleToString(closeL,2)," lots");
+      CloseProportionalAllPositions(direction, InpLadderFrac1, "SYM LADDER R1");
+      rungs = 1;
+      // Rung 1: move all remaining stops to breakeven immediately
+      if(direction > 0) g_longBEActive  = true;
+      else              g_shortBEActive = true;
+      MoveStopsToBreakeven(direction);
+   }
+   else if(rungs == 1 && ratio >= InpLadderRung2)
+   {
+      double closeL = NormalizeDouble(totalLots * InpLadderFrac2, 2);
+      Print("SYM LADDER Rung2 ",dirStr," ratio=",DoubleToString(ratio,2),
+            " closing=",DoubleToString(closeL,2)," lots");
+      CloseProportionalAllPositions(direction, InpLadderFrac2, "SYM LADDER R2");
+      rungs = 2;
+      // Rung 2: activate trailing — locks InpTrailLockPct of move each bar
+      if(direction > 0) { g_longBEActive = false;  g_longTrailActive  = true; }
+      else              { g_shortBEActive = false; g_shortTrailActive = true; }
+   }
+   else if(rungs == 2 && ratio >= InpLadderRung3)
+   {
+      double closeL = NormalizeDouble(totalLots * InpLadderFrac3, 2);
+      Print("SYM LADDER Rung3 ",dirStr," ratio=",DoubleToString(ratio,2),
+            " closing=",DoubleToString(closeL,2)," lots");
+      CloseProportionalAllPositions(direction, InpLadderFrac3, "SYM LADDER R3");
+      rungs = 3;
+      // Rung 3: trail stays active on the final runner
+   }
+}
+
+void RunProfitLadder()
+{
+   RunProfitLadderDirection( 1, g_longRungs);
+   RunProfitLadderDirection(-1, g_shortRungs);
+}
+
+
+//==================================================================
+// 14. EQUITY KILL SWITCH - REMOVED
+// Kill switch removed — equity drawdown measured from floating high-water
+// is not a real balance drawdown. Profit ladder + trailing stops are the
+// correct mechanism for protecting captured gains.
+
+//==================================================================
+// 15. TRADING EXECUTION
+// Pre-entry basket ceiling applied before every OrderSend.
+// No trimming needed: if the ceiling is reached, entry is skipped.
+// One entry per direction per bar (same bar-time guard as v1.6).
+//==================================================================
+void ExecuteTrading()
+{
+   int barsAvail = (int)ArraySize(Close);
+   if(barsAvail < 3) return;
+   if(!IsTradeTime()) return;
+
+   int      shiftNow = 1;
+   double   closeNow = Close[shiftNow];
+   double   atrNow   = GetATR(shiftNow);
+   datetime barTime  = Time[0];
+   double   equity   = AccountInfoDouble(ACCOUNT_EQUITY);
+   double   riskCash = equity * InpRiskPercent * 0.01;
+
+   bool L3 = (g_mode == 1  && g_phaseLong  == 3);
+   bool L4 = (g_mode == 1  && g_phaseLong  == 4);
+   bool S3 = (g_mode == -1 && g_phaseShort == 3);
+   bool S4 = (g_mode == -1 && g_phaseShort == 4);
+   double impL = g_anchorHigh - g_anchorLow;
+   double impS = g_anchorHigh - g_anchorLow;
+
+   // Counter-direction block:
+   // Do not open longs while the short book is net profitable, and vice versa.
+   // A counter-trend bounce inside a running profitable campaign is not a
+   // new campaign — it is noise. Opening against a profitable book destroys
+   // net P&L even when both sides eventually work.
+   bool shortBookProfitable = (GetDirectionFloatingPnL(-1) > 0.0);
+   bool longBookProfitable  = (GetDirectionFloatingPnL( 1) > 0.0);
+   if(shortBookProfitable) { L3 = false; L4 = false; }
+   if(longBookProfitable)  { S3 = false; S4 = false; }
+
+   // --- LONG P3 ---
+   if(L3 && g_lastLongTradeTime != barTime)
+   {
+      double entry = closeNow;
+      double sl    = g_anchorLow - atrNow * 0.25;
+      if(sl > 0.0 && entry > sl)
+      {
+         double lots = ComputeLots(riskCash, entry, sl);
+         lots = AdjustLotsForBasketCeiling(1, entry, sl, lots);
+         if(lots > 0.0 && SendMarketOrder(+1, lots, sl, "SYM P3 Long"))
+            g_lastLongTradeTime = barTime;
+      }
+   }
+
+   // --- LONG P4 ---
+   if(L4 && g_lastLongTradeTime != barTime && impL > 0.0)
+   {
+      bool bo = (closeNow > g_anchorHigh || closeNow > High[shiftNow+1] + 0.20*atrNow);
+      if(bo)
+      {
+         double entry = closeNow;
+         double sl    = g_anchorLow - atrNow * 0.25;
+         if(sl > 0.0 && entry > sl)
+         {
+            double lots = ComputeLots(riskCash, entry, sl);
+            lots = AdjustLotsForBasketCeiling(1, entry, sl, lots);
+            if(lots > 0.0 && SendMarketOrder(+1, lots, sl, "SYM P4 Long"))
+               g_lastLongTradeTime = barTime;
+         }
+      }
+   }
+
+   // --- SHORT P3 ---
+   if(S3 && g_lastShortTradeTime != barTime)
+   {
+      double entry = closeNow;
+      double sl    = g_anchorHigh + atrNow * 0.25;
+      if(sl > 0.0 && sl > entry)
+      {
+         double lots = ComputeLots(riskCash, entry, sl);
+         lots = AdjustLotsForBasketCeiling(-1, entry, sl, lots);
+         if(lots > 0.0 && SendMarketOrder(-1, lots, sl, "SYM P3 Short"))
+            g_lastShortTradeTime = barTime;
+      }
+   }
+
+   // --- SHORT P4 ---
+   if(S4 && g_lastShortTradeTime != barTime && impS > 0.0)
+   {
+      bool bo = (closeNow < g_anchorLow || closeNow < Low[shiftNow+1] - 0.20*atrNow);
+      if(bo)
+      {
+         double entry = closeNow;
+         double sl    = g_anchorHigh + atrNow * 0.25;
+         if(sl > 0.0 && sl > entry)
+         {
+            double lots = ComputeLots(riskCash, entry, sl);
+            lots = AdjustLotsForBasketCeiling(-1, entry, sl, lots);
+            if(lots > 0.0 && SendMarketOrder(-1, lots, sl, "SYM P4 Short"))
+               g_lastShortTradeTime = barTime;
+         }
+      }
+   }
+}
+
+
+//==================================================================
+// 16. ARC + INSTITUTIONAL + PHASE COMPOSITE EXIT
+//
+// EXIT GATE FIX:
+//   Original bug: phaseTrendEndLong required g_mode==1 at check time.
+//   When price chops at the peak, UpdatePhaseEngine's invalidation
+//   block runs first and zeros g_mode → condition never fires →
+//   basket sits open riding the reversal back down.
+//
+//   Fix: A second exit path fires when g_modeInvalidatedLong==true
+//   AND g_phaseAtInvalidLong was 3 or 4. This captures "mode was
+//   invalidated while the campaign was at its trend extreme" and
+//   triggers a full exit on remaining longs.
+//   g_modeInvalidatedLong/Short are cleared at the end of this
+//   function after being consumed.
+//==================================================================
+void ManageArcInstitutionalExits()
+{
+   int barsAvail = (int)ArraySize(Close);
+   if(barsAvail <= (2*InpPivotLen + 5)) return;
+
+   int    shiftNow = 1;
+   double closeNow = Close[shiftNow];
+   double atrNow   = GetATR(shiftNow);
+
+   // --- ARC exhaustion flags ---
+   bool arcExhaustLong  = (g_mode == 1  && g_arcLong  > 0.0
+                           && closeNow >= (g_arcLong  - InpArcToleranceAtr * atrNow));
+   bool arcExhaustShort = (g_mode == -1 && g_arcShort > 0.0
+                           && closeNow <= (g_arcShort + InpArcToleranceAtr * atrNow));
+
+   // --- Institutional bands ---
+   double instLevelL = (g_longInducPrice  != 0.0 ? g_longInducPrice  : g_anchorHigh);
+   double innerTopL  = (g_longInducHigh   > 0.0  ? g_longInducHigh   : instLevelL);
+   double outerTopL  = innerTopL + InpOuterBandAtrMult * atrNow;
+
+   double instLevelS = (g_shortInducPrice != 0.0 ? g_shortInducPrice : g_anchorLow);
+   double innerBotS  = (g_shortInducLow   > 0.0  ? g_shortInducLow   : instLevelS);
+   double outerBotS  = innerBotS - InpOuterBandAtrMult * atrNow;
+
+   // --- Track outer-band sweeps ---
+   if(g_mode == 1  && instLevelL > 0.0 && closeNow > outerTopL) g_longOuterBreachSeen  = true;
+   if(g_mode == -1 && instLevelS > 0.0 && closeNow < outerBotS) g_shortOuterBreachSeen = true;
+
+   // --- Phase collapse condition (normal path: mode still active) ---
+   bool phaseTrendEndLong =
+      (g_mode == 1 &&
+       (g_prevPhaseLong == 3 || g_prevPhaseLong == 4) &&
+       g_phaseLong <= 1);
+
+   bool phaseTrendEndShort =
+      (g_mode == -1 &&
+       (g_prevPhaseShort == 3 || g_prevPhaseShort == 4) &&
+       g_phaseShort <= 1);
+
+   // --- Exit decisions ---
+   bool exitLong  = false;
+   bool exitShort = false;
+
+   // Normal path: ARC exhaust + phase collapse + institutional pattern
+   if(g_mode == 1 && arcExhaustLong && phaseTrendEndLong)
+   {
+      bool hasInstL     = (instLevelL > 0.0);
+      bool instPatternL = !hasInstL || (g_longOuterBreachSeen && closeNow < innerTopL);
+      if(instPatternL) exitLong = true;
+   }
+   if(g_mode == -1 && arcExhaustShort && phaseTrendEndShort)
+   {
+      bool hasInstS     = (instLevelS > 0.0);
+      bool instPatternS = !hasInstS || (g_shortOuterBreachSeen && closeNow > innerBotS);
+      if(instPatternS) exitShort = true;
+   }
+
+   // FIX: Mode-invalidation-at-peak exit path.
+   // Fires when the phase engine zeroed g_mode because price broke
+   // the anchor, BUT phase was 3 or 4 at the moment of invalidation.
+   // This is "trend-peak chop caused mode flip" = same economic event
+   // as phaseTrendEnd, just detected via a different code path.
+   if(!exitLong  && g_modeInvalidatedLong
+      && (g_phaseAtInvalidLong == 3 || g_phaseAtInvalidLong == 4))
+   {
+      Print("SYM EXIT: mode-invalidation-at-peak triggered long exit",
+            " phaseAtInvalid=", g_phaseAtInvalidLong);
+      exitLong = true;
+   }
+   if(!exitShort && g_modeInvalidatedShort
+      && (g_phaseAtInvalidShort == 3 || g_phaseAtInvalidShort == 4))
+   {
+      Print("SYM EXIT: mode-invalidation-at-peak triggered short exit",
+            " phaseAtInvalid=", g_phaseAtInvalidShort);
+      exitShort = true;
+   }
+
+   // --- Execute exits ---
+   if(exitLong || exitShort)
+   {
+      int total = PositionsTotal();
+      for(int i = 0; i < total; i++)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(!PositionSelectByTicket(ticket)) continue;
+         if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+         if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+         long type = PositionGetInteger(POSITION_TYPE);
+         if(exitLong  && type == POSITION_TYPE_BUY)
+            ClosePositionFull(ticket, "SYM ARC EXIT");
+         if(exitShort && type == POSITION_TYPE_SELL)
+            ClosePositionFull(ticket, "SYM ARC EXIT");
+      }
+   }
+
+   // Consume invalidation flags - must be cleared after use so they
+   // do not re-trigger the exit path on subsequent bars.
+   g_modeInvalidatedLong  = false;
+   g_modeInvalidatedShort = false;
+}
+
+
+//==================================================================
+// 17. STANDARD CALLBACKS
+//==================================================================
+int OnInit()
+{
+   // Phase engine state
+   g_lastPivotPrice     = 0.0; g_lastPivotShift  = -1; g_lastPivotDir   = 0;
+   g_prevPivotPrice     = 0.0; g_prevPivotShift  = -1; g_prevPivotDir   = 0;
+   g_mode               = 0;
+   g_anchorHigh         = 0.0; g_anchorLow       = 0.0;
+   g_anchorHighShift    = -1;  g_anchorLowShift  = -1;
+   g_phaseShort         = 0;   g_phaseLong       = 0;
+   g_prevPhaseShort     = 0;   g_prevPhaseLong   = 0;
+   g_shortInducPrice    = 0.0; g_shortInducLow   = 0.0; g_shortInducHigh = 0.0;
+   g_longInducPrice     = 0.0; g_longInducLow    = 0.0; g_longInducHigh  = 0.0;
+   g_shortPreConvSeen   = false; g_longPreConvSeen = false;
+   g_arcLong            = 0.0; g_arcShort        = 0.0;
+   g_longOuterBreachSeen  = false; g_shortOuterBreachSeen = false;
+   g_lastBarTime        = 0;
+   g_lastLongTradeTime  = 0; g_lastShortTradeTime = 0;
+
+   // Exit gate fix state
+   g_modeInvalidatedLong  = false; g_modeInvalidatedShort  = false;
+   g_phaseAtInvalidLong   = 0;     g_phaseAtInvalidShort   = 0;
+
+   // Profit ladder state
+   g_longRungs  = 0; g_shortRungs = 0;
+   g_longBEActive = false;  g_shortBEActive = false;
+   g_longTrailActive = false; g_shortTrailActive = false;
+
+   // Kill switch removed
+   g_equityHighWater = AccountInfoDouble(ACCOUNT_EQUITY);
+
+   if(!RefreshSeries()) return INIT_FAILED;
+
+   Print("SYMPHONY v3.0 loaded.");
+   Print("  InpRiskPercent=",     InpRiskPercent,
+         " InpMaxBasketRiskPct=", InpMaxBasketRiskPct);
+   Print("  Ladder rungs: ",InpLadderRung1,"x/",InpLadderRung2,"x/",InpLadderRung3,"x",
+         " fracs: ",InpLadderFrac1,"/",InpLadderFrac2,"/",InpLadderFrac3);
+   Print("  ArcExtMult=", InpArcExtMult, " (1.0 = impulse height target)");
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason) {}
+
+void OnTick()
+{
+   if(!RefreshSeries()) return;
+   if(!IsNewBar())      return;
+
+   // 1. Update structure and phases
+   //    (also sets g_modeInvalidatedLong/Short + g_phaseAtInvalidLong/Short)
+   UpdatePhaseEngine();
+
+   // 2. Update ARC target
+   UpdateARC();
+
+   // 3. Profit ladder and trailing stop protection
+   RunStopProtection();
+   RunProfitLadder();
+
+   // 5. ARC + institutional + phase/invalidation composite exit
+   //    Consumes g_modeInvalidatedLong/Short flags at the end.
+   ManageArcInstitutionalExits();
+
+   // 6. Open new Phase 3 / Phase 4 entries (time-gated, basket-ceiling checked)
+   ExecuteTrading();
+}
+//+------------------------------------------------------------------+

@@ -127,6 +127,7 @@ input int    InpCurvEmaPeriod      = 12;     // EMA period that smooths basket P
 input double InpCurvArmR           = 1.5;    // Arm peak-watch once PnL >= this x basket risk
 input int    InpCurvConfirmTicks   = 4;      // Consecutive decelerating samples to confirm peak
 input double InpCurvGivebackR       = 0.5;    // PnL must fall this x risk below peak before exit (0 = fire at inflection)
+input double InpCurvGivebackPctPeak = 0.30;   // ...OR this fraction of peak profit, whichever is LARGER (gives fast moves room)
 input double InpCurvVelCollapse     = 0.25;   // Downward speed must reach this x the prior up-thrust (0 = any down-tick)
 input double InpCurvCloseFrac       = 1.0;    // Fraction of direction book to close at peak (1.0 = all)
 
@@ -1200,13 +1201,16 @@ void UpdateCurvatureDirection(int direction, CurvState &st, datetime now)
 
    double refRisk = (st.armRisk > 0.0 ? st.armRisk : risk);
 
-   // GIVE-BACK GATE — the primary "don't exit too early" filter.
-   // Do not exit at the inflection; wait until the smoothed PnL has
-   // actually retreated GivebackR x risk from its high-water mark.
-   // Minor pauses never retreat this far, so they are ignored; only a
-   // real rollover qualifies. (0 disables → fire at the inflection.)
-   bool givebackOK = (InpCurvGivebackR <= 0.0) ||
-                     (refRisk > 0.0 && (st.peakPnL - st.emaPnL) >= InpCurvGivebackR * refRisk);
+   // GIVE-BACK GATE — trail the peak by the LARGER of an R floor and a
+   // percentage of the peak profit. The percentage term widens the
+   // tolerance automatically for big, fast moves (a parabolic run is
+   // allowed a much deeper pullback before exit), while the R floor keeps
+   // small winners on a tight leash. This is what stops the engine from
+   // cutting fast momentum trades on a routine mid-move pullback.
+   double gbByRisk = (InpCurvGivebackR       > 0.0 && refRisk     > 0.0) ? InpCurvGivebackR       * refRisk     : 0.0;
+   double gbByPeak = (InpCurvGivebackPctPeak > 0.0 && st.peakPnL  > 0.0) ? InpCurvGivebackPctPeak * st.peakPnL  : 0.0;
+   double gbThresh = MathMax(gbByRisk, gbByPeak);
+   bool givebackOK = (gbThresh <= 0.0) || ((st.peakPnL - st.emaPnL) >= gbThresh);
 
    // VELOCITY-COLLAPSE GATE — downward speed must be a real fraction of
    // the prior up-thrust, i.e. momentum genuinely reversed rather than
@@ -1222,6 +1226,7 @@ void UpdateCurvatureDirection(int direction, CurvState &st, datetime now)
       Print("SYM CURV EXIT ", (direction > 0 ? "LONG" : "SHORT"),
             " peak=",  DoubleToString(st.peakPnL, 2),
             " now=",   DoubleToString(st.emaPnL, 2),
+            " gbThr=", DoubleToString(gbThresh, 2),
             " vel=",   DoubleToString(vel, 2),
             " peakVel=", DoubleToString(st.peakVel, 2),
             " accel=", DoubleToString(accel, 2),

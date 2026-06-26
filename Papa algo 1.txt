@@ -104,6 +104,32 @@ input double InpTrailLockPct      = 50.0;   // % of price move to lock after run
 //==================================================================
 input int    InpTargetGMT         = 0;      // Session GMT offset
 
+//==================================================================
+// 1G. STRUCTURE + DESTINATION TRAIL  (peak catcher v2)
+// Manages the protective stop using PRICE STRUCTURE and the ARC
+// destination instead of the floating PnL curve. This is what the
+// curvature exit could not do: it knows WHERE the move is going and
+// only tightens at the exhaustion zone, so it rides momentum.
+//
+//  TWO REGIMES:
+//   WIDE  — while price is still travelling toward the ARC target, the
+//           stop trails the last confirmed swing (higher-low for longs,
+//           lower-high for shorts) minus a wide ATR buffer. A momentum
+//           move makes higher lows, so the stop is never hit mid-run.
+//   TIGHT — once price reaches the ARC destination zone (or the trend
+//           is gone), the stop switches to a chandelier (highest-high
+//           minus a small ATR) that hugs the peak and catches the top.
+//
+// The stop lives on the broker, so it protects INTRABAR even though the
+// EA only re-evaluates on new bars. Default OFF — toggle on to test.
+// When ON it replaces the post-Rung2 50% trail (break-even still runs).
+//==================================================================
+input bool   InpUseStructureTrail   = false;  // Enable structure + destination trail
+input int    InpStructLookbackBars   = 120;    // Bars to search for swings / extremes
+input double InpStructWideBufAtr      = 1.00;   // WIDE regime: ATR buffer beyond the swing
+input double InpStructTightChandAtr   = 1.25;   // TIGHT regime: ATR distance from the peak (chandelier)
+input double InpDestZoneAtr           = 1.00;   // Distance to ARC target that counts as "at destination" (ATR)
+
 
 //==================================================================
 // 2. GLOBAL STATE - PHASE ENGINE
@@ -786,8 +812,11 @@ void RunStopProtection()
 {
    if(g_longBEActive  && !g_longTrailActive)  MoveStopsToBreakeven(1);
    if(g_shortBEActive && !g_shortTrailActive) MoveStopsToBreakeven(-1);
-   if(g_longTrailActive)  TrailStops(1);
-   if(g_shortTrailActive) TrailStops(-1);
+   // When the structure+destination trail is active it owns the trailing
+   // stop, so the old entry-anchored 50% trail is skipped to avoid two
+   // trail logics fighting. Break-even moves above still run.
+   if(g_longTrailActive  && !InpUseStructureTrail) TrailStops(1);
+   if(g_shortTrailActive && !InpUseStructureTrail) TrailStops(-1);
 }
 
 
@@ -956,6 +985,176 @@ void RunProfitLadder()
 {
    RunProfitLadderDirection( 1, g_longRungs);
    RunProfitLadderDirection(-1, g_shortRungs);
+}
+
+
+//==================================================================
+// 13C. STRUCTURE + DESTINATION TRAIL  (peak catcher v2)
+// Solutions #1 (swing-structure trail) + #2 (destination regime).
+// Reads price structure + the ARC target, sets a ratcheting broker
+// stop. Rides momentum while travelling, hugs the peak at the
+// destination. Stateless — recomputed from broker + structure each bar.
+//==================================================================
+
+// Count open positions in a direction.
+int ST_CountPositions(int direction)
+{
+   int c = 0;
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if((type == POSITION_TYPE_BUY ? 1 : -1) == direction) c++;
+   }
+   return c;
+}
+
+double ST_HighestHigh(int lookback)
+{
+   int bars = (int)ArraySize(High);
+   int n = MathMin(lookback, bars - 1);
+   if(n < 1) return 0.0;
+   double m = High[1];
+   for(int i = 1; i <= n; i++) if(High[i] > m) m = High[i];
+   return m;
+}
+
+double ST_LowestLow(int lookback)
+{
+   int bars = (int)ArraySize(Low);
+   int n = MathMin(lookback, bars - 1);
+   if(n < 1) return 0.0;
+   double m = Low[1];
+   for(int i = 1; i <= n; i++) if(Low[i] < m) m = Low[i];
+   return m;
+}
+
+// Most recent CONFIRMED swing low (uses the same pivot test as the
+// phase engine). Returns 0 if none found in the lookback window.
+double ST_RecentSwingLow(int lookback)
+{
+   int bars  = (int)ArraySize(Low);
+   int start = InpPivotLen + 1;
+   int end   = MathMin(start + lookback, bars - InpPivotLen - 1);
+   for(int c = start; c <= end; c++)
+      if(IsPivotLow(c)) return Low[c];
+   return 0.0;
+}
+
+double ST_RecentSwingHigh(int lookback)
+{
+   int bars  = (int)ArraySize(High);
+   int start = InpPivotLen + 1;
+   int end   = MathMin(start + lookback, bars - InpPivotLen - 1);
+   for(int c = start; c <= end; c++)
+      if(IsPivotHigh(c)) return High[c];
+   return 0.0;
+}
+
+// Apply a ratcheting stop to every position in a direction.
+// Long: only ever raises SL and keeps it below market.
+// Short: only ever lowers SL and keeps it above market.
+void ST_ApplyTrail(int direction, double level)
+{
+   if(level <= 0.0) return;
+   double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   long   stops  = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist = (stops > 0 ? stops * point : 0.0) + point;
+   int    dig    = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   // Keep the level a valid distance off the current market.
+   if(direction > 0) { double cap = bid - minDist; if(level > cap) level = cap; }
+   else              { double cap = ask + minDist; if(level < cap) level = cap; }
+   level = NormalizeDouble(level, dig);
+
+   int cnt = PositionsTotal();
+   for(int i = 0; i < cnt; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if((type == POSITION_TYPE_BUY ? 1 : -1) != direction) continue;
+
+      double curSL = PositionGetDouble(POSITION_SL);
+      double curTP = PositionGetDouble(POSITION_TP);
+
+      bool improve = (direction > 0) ? (curSL == 0.0 || level > curSL)
+                                     : (curSL == 0.0 || level < curSL);
+      if(direction > 0 && level >= bid) improve = false; // never wrong side of market
+      if(direction < 0 && level <= ask) improve = false;
+      if(!improve) continue;
+
+      MqlTradeRequest req; MqlTradeResult res;
+      ZeroMemory(req); ZeroMemory(res);
+      req.action   = TRADE_ACTION_SLTP;
+      req.symbol   = _Symbol;
+      req.position = ticket;
+      req.sl       = level;
+      req.tp       = curTP;
+      OrderSend(req, res); // silent
+   }
+}
+
+void ManageStructureTrailDirection(int direction)
+{
+   if(ST_CountPositions(direction) == 0) return;
+
+   double atr = GetATR(1); if(atr <= 0.0) atr = 10.0;
+   double closeNow = Close[1];
+
+   // Destination from the ARC engine (only valid while this direction owns the mode).
+   double arc    = (direction > 0 ? g_arcLong : g_arcShort);
+   bool   hasArc = (arc > 0.0 && g_mode == direction);
+
+   // Are we in the destination zone (or has the trend evaporated)? → tighten.
+   bool nearDest = false;
+   if(hasArc)
+   {
+      if(direction > 0) nearDest = (closeNow >= arc - InpDestZoneAtr * atr);
+      else              nearDest = (closeNow <= arc + InpDestZoneAtr * atr);
+   }
+   bool tight = (!hasArc) || nearDest;
+
+   double level = 0.0;
+   if(direction > 0)
+   {
+      if(tight)
+         level = ST_HighestHigh(InpStructLookbackBars) - InpStructTightChandAtr * atr;
+      else
+      {
+         double sw = ST_RecentSwingLow(InpStructLookbackBars);
+         level = (sw > 0.0) ? sw - InpStructWideBufAtr * atr
+                            : ST_HighestHigh(InpStructLookbackBars) - 2.0 * InpStructWideBufAtr * atr;
+      }
+   }
+   else
+   {
+      if(tight)
+         level = ST_LowestLow(InpStructLookbackBars) + InpStructTightChandAtr * atr;
+      else
+      {
+         double sw = ST_RecentSwingHigh(InpStructLookbackBars);
+         level = (sw > 0.0) ? sw + InpStructWideBufAtr * atr
+                            : ST_LowestLow(InpStructLookbackBars) + 2.0 * InpStructWideBufAtr * atr;
+      }
+   }
+
+   ST_ApplyTrail(direction, level);
+}
+
+void ManageStructureTrail()
+{
+   if(!InpUseStructureTrail) return;
+   ManageStructureTrailDirection( 1);
+   ManageStructureTrailDirection(-1);
 }
 
 
@@ -1246,6 +1445,9 @@ void OnTick()
    // 3. Profit ladder and trailing stop protection
    RunStopProtection();
    RunProfitLadder();
+
+   // 4. Structure + destination trail (peak catcher v2, default OFF)
+   ManageStructureTrail();
 
    // 5. ARC + institutional + phase/invalidation composite exit
    //    Consumes g_modeInvalidatedLong/Short flags at the end.

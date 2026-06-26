@@ -104,6 +104,31 @@ input double InpTrailLockPct      = 50.0;   // % of price move to lock after run
 //==================================================================
 input int    InpTargetGMT         = 0;      // Session GMT offset
 
+//==================================================================
+// 1G. PnL CURVATURE EXIT  ("the math of a peak")
+// Catches the basket PnL peak the instant profit growth decelerates
+// and curvature flips negative — i.e. the first derivative of basket
+// PnL rolls to <= 0 while the second derivative is < 0.
+//
+// Runs EVERY TICK (before the new-bar gate). A profit spike on M15
+// forms and dies inside a candle; bar-close logic never sees it.
+//
+//  - Basket PnL per direction is sampled on a fixed cadence and
+//    EMA-smoothed (raw tick PnL is far too noisy for derivatives).
+//  - Peak-watch only ARMS once profit is meaningful (>= ArmR x risk),
+//    so the engine never reacts to chop around break-even.
+//  - velocity = d(emaPnL)/dt ,  accel = d(velocity)/dt.
+//  - Fires after ConfirmTicks consecutive samples of (vel<=0 & accel<0).
+//  - A fresh push up (vel>0) resets the watch — it rides the trend.
+//==================================================================
+input bool   InpUseCurvatureExit  = true;   // Enable PnL-curvature peak exit
+input int    InpCurvSampleSecs     = 2;      // Min seconds between PnL samples (fixed dt)
+input int    InpCurvEmaPeriod      = 6;      // EMA period that smooths basket PnL
+input double InpCurvArmR           = 0.8;    // Arm peak-watch once PnL >= this x basket risk
+input int    InpCurvConfirmTicks   = 3;      // Consecutive decelerating samples to confirm peak
+input double InpCurvGivebackR       = 0.0;    // Extra confirm: PnL must fall this x risk below peak (0 = pure curvature)
+input double InpCurvCloseFrac       = 1.0;    // Fraction of direction book to close at peak (1.0 = all)
+
 
 //==================================================================
 // 2. GLOBAL STATE - PHASE ENGINE
@@ -185,6 +210,29 @@ bool     g_shortTrailActive  = false; // trail short stops
 // 5. GLOBAL STATE - KILL SWITCH (removed)
 //==================================================================
 double   g_equityHighWater   = 0.0; // retained for reference only
+
+//==================================================================
+// 5B. GLOBAL STATE - PnL CURVATURE EXIT
+// One tracker per direction. Holds the EMA-smoothed basket PnL, its
+// running peak (high-water), and the previous sample's smoothed PnL +
+// velocity so the first and second derivatives can be formed. State
+// resets automatically when the direction's book goes flat.
+//==================================================================
+struct CurvState
+{
+   double   emaPnL;       // EMA-smoothed basket PnL (the curve we differentiate)
+   double   prevEmaPnL;   // smoothed PnL at previous sample
+   double   prevVel;      // velocity (1st derivative) at previous sample
+   double   peakPnL;      // high-water mark of smoothed PnL
+   double   armRisk;      // basket risk snapshot taken when armed
+   datetime lastSample;   // time of last accepted sample (sampling cadence)
+   datetime lastFire;     // time of last exit (cooldown)
+   int      samples;      // samples collected since flat (warm-up counter)
+   int      decelCount;   // consecutive "vel<=0 & accel<0" samples
+   bool     armed;        // peak-watch active (profit passed ArmR threshold)
+};
+CurvState g_curvLong;
+CurvState g_curvShort;
 
 
 //==================================================================
@@ -960,6 +1008,181 @@ void RunProfitLadder()
 
 
 //==================================================================
+// 13B. PnL CURVATURE EXIT  ("the math of a peak")
+// A profit peak is, literally, where the first derivative of basket
+// PnL hits zero and the second derivative turns negative. This engine
+// samples basket PnL per direction on a fixed cadence, smooths it,
+// and exits the instant the smoothed curve stops rising AND starts
+// decelerating — catching the top within a sample or two instead of
+// giving back a fixed percentage.
+//==================================================================
+
+// Count open positions in a direction.
+int CountDirectionPositions(int direction)
+{
+   int c = 0;
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if((type == POSITION_TYPE_BUY ? 1 : -1) == direction) c++;
+   }
+   return c;
+}
+
+// Basket dollar-risk with a 1-ATR floor per leg.
+// GetBasketDollarRisk() returns 0 once stops sit at break-even
+// (distSL collapses to 0), which would make the R-multiple arm
+// threshold meaningless. Flooring keeps the threshold stable for the
+// life of the campaign — same trick the profit ladder uses internally.
+double GetBasketDollarRiskFloored(int direction)
+{
+   double atrFB = GetATR(1); if(atrFB <= 0.0) atrFB = 10.0;
+   double totalRisk = 0.0;
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if((type == POSITION_TYPE_BUY ? 1 : -1) != direction) continue;
+      double lots  = PositionGetDouble(POSITION_VOLUME);
+      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl    = PositionGetDouble(POSITION_SL);
+      double distSL = (sl > 0.0) ? MathAbs(entry - sl) : atrFB;
+      if(distSL < 1.0) distSL = atrFB;   // floor so post-BE risk stays meaningful
+      totalRisk += lots * distSL * 100.0;
+   }
+   return totalRisk;
+}
+
+// Close a fraction of a direction's book. frac>=~1 closes everything
+// (iterating downward, since full closes shift live indices).
+void CloseDirectionFraction(int direction, double frac, const string tag)
+{
+   if(frac >= 0.999)
+   {
+      int total = PositionsTotal();
+      for(int i = total - 1; i >= 0; i--)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(!PositionSelectByTicket(ticket)) continue;
+         if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+         if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+         long type = PositionGetInteger(POSITION_TYPE);
+         if((type == POSITION_TYPE_BUY ? 1 : -1) != direction) continue;
+         ClosePositionFull(ticket, tag);
+      }
+   }
+   else
+   {
+      CloseProportionalAllPositions(direction, frac, tag);
+   }
+}
+
+void ResetCurvState(CurvState &st)
+{
+   st.emaPnL     = 0.0;
+   st.prevEmaPnL = 0.0;
+   st.prevVel    = 0.0;
+   st.peakPnL    = 0.0;
+   st.armRisk    = 0.0;
+   st.lastSample = 0;
+   st.samples    = 0;
+   st.decelCount = 0;
+   st.armed      = false;
+   // lastFire deliberately preserved so the cooldown survives a flat book
+}
+
+void UpdateCurvatureDirection(int direction, CurvState &st, datetime now)
+{
+   // Flat book → nothing to track, reset and bail.
+   if(CountDirectionPositions(direction) == 0) { ResetCurvState(st); return; }
+
+   // Sample on a fixed cadence so dt is ~constant → acceleration is comparable.
+   if(st.lastSample != 0 && (now - st.lastSample) < InpCurvSampleSecs) return;
+
+   double pnl   = GetDirectionFloatingPnL(direction);
+   double risk  = GetBasketDollarRiskFloored(direction);
+   double alpha = 2.0 / (InpCurvEmaPeriod + 1.0);
+
+   // Seed the smoother on the first sample of a fresh campaign.
+   if(st.samples == 0)
+   {
+      st.emaPnL = pnl; st.prevEmaPnL = pnl; st.prevVel = 0.0; st.peakPnL = pnl;
+   }
+   else
+   {
+      st.emaPnL = alpha * pnl + (1.0 - alpha) * st.emaPnL;
+   }
+
+   // High-water mark of the smoothed PnL.
+   if(st.emaPnL > st.peakPnL) st.peakPnL = st.emaPnL;
+
+   // Arm the peak-watch only once profit is genuinely meaningful.
+   if(!st.armed && risk > 0.0 && st.emaPnL >= InpCurvArmR * risk)
+   {
+      st.armed   = true;
+      st.armRisk = risk;
+   }
+
+   // First and second derivatives of the smoothed PnL curve.
+   double vel   = st.emaPnL - st.prevEmaPnL;   // d(PnL)/dt
+   double accel = vel - st.prevVel;            // d2(PnL)/dt2
+
+   // Peak signature: profit no longer rising AND decelerating.
+   // A fresh upward push cancels the watch so the engine rides trends.
+   if(st.armed && st.samples >= 3 && vel <= 0.0 && accel < 0.0)
+      st.decelCount++;
+   else if(vel > 0.0)
+      st.decelCount = 0;
+
+   // Optional give-back confirmation (0 = pure curvature, fire at the inflection).
+   double refRisk = (st.armRisk > 0.0 ? st.armRisk : risk);
+   bool givebackOK = (InpCurvGivebackR <= 0.0) ||
+                     (refRisk > 0.0 && (st.peakPnL - st.emaPnL) >= InpCurvGivebackR * refRisk);
+
+   bool cooldownOK = (st.lastFire == 0 || (now - st.lastFire) > 30);
+
+   if(st.armed && st.decelCount >= InpCurvConfirmTicks && givebackOK && cooldownOK)
+   {
+      Print("SYM CURV EXIT ", (direction > 0 ? "LONG" : "SHORT"),
+            " peak=",  DoubleToString(st.peakPnL, 2),
+            " now=",   DoubleToString(st.emaPnL, 2),
+            " vel=",   DoubleToString(vel, 2),
+            " accel=", DoubleToString(accel, 2),
+            " decel=", st.decelCount);
+      CloseDirectionFraction(direction, InpCurvCloseFrac, "SYM CURV PEAK");
+      st.lastFire   = now;
+      // Disarm: require a fresh climb to a new peak before firing again.
+      st.armed      = false;
+      st.decelCount = 0;
+      st.peakPnL    = st.emaPnL;
+   }
+
+   // Advance the sample window.
+   st.prevEmaPnL = st.emaPnL;
+   st.prevVel    = vel;
+   st.lastSample = now;
+   st.samples++;
+}
+
+void UpdateCurvatureExit()
+{
+   if(!InpUseCurvatureExit) return;
+   datetime now = TimeCurrent();
+   UpdateCurvatureDirection( 1, g_curvLong,  now);
+   UpdateCurvatureDirection(-1, g_curvShort, now);
+}
+
+
+//==================================================================
 // 14. EQUITY KILL SWITCH - REMOVED
 // Kill switch removed — equity drawdown measured from floating high-water
 // is not a real balance drawdown. Profit ladder + trailing stops are the
@@ -1215,6 +1438,12 @@ int OnInit()
    g_longBEActive = false;  g_shortBEActive = false;
    g_longTrailActive = false; g_shortTrailActive = false;
 
+   // Curvature exit state
+   ResetCurvState(g_curvLong);
+   ResetCurvState(g_curvShort);
+   g_curvLong.lastFire  = 0;
+   g_curvShort.lastFire = 0;
+
    // Kill switch removed
    g_equityHighWater = AccountInfoDouble(ACCOUNT_EQUITY);
 
@@ -1234,6 +1463,13 @@ void OnDeinit(const int reason) {}
 void OnTick()
 {
    if(!RefreshSeries()) return;
+
+   // PER-TICK PEAK CATCHER — runs BEFORE the new-bar gate.
+   // A basket-PnL spike on M15 forms and dies inside a single candle;
+   // bar-close logic never sees it. The curvature exit samples PnL
+   // continuously and flattens the book at the inflection point.
+   UpdateCurvatureExit();
+
    if(!IsNewBar())      return;
 
    // 1. Update structure and phases

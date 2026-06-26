@@ -104,6 +104,38 @@ input double InpTrailLockPct      = 50.0;   // % of price move to lock after run
 //==================================================================
 input int    InpTargetGMT         = 0;      // Session GMT offset
 
+//==================================================================
+// 1G. LETRA MULTI-TF CONTEXT LAYER (ported from Letra37, default OFF)
+// Adds higher-timeframe awareness on top of SYMPHONY's own phase engine.
+// SYMPHONY keeps its own phase cycle + flip zone as the EXECUTION authority;
+// this layer only supplies CONTEXT and gates the P3/P4 entries:
+//   - 6-TF structure (M1..H4): direction, dominance, compression, recursion
+//   - Hierarchical Ownership (who owns price across the TF stack)
+//   - Flip-context (buys below / sells above the HTF flip mid)
+//   - Dominance transfer (first-strike vs entry-cycle) filter
+//   - Ownership-Death engine (allow counter-trend only when owner is dying)
+//   - Owner-Driven Destination (ODDE) target, published for reference
+//   - News-window block
+// Default OFF — flip InpUseLetraCtx to true to A/B test.
+//==================================================================
+input bool   InpUseLetraCtx    = false;  // MASTER: compute Letra 6-TF context + apply entry gates
+input int    InpCtxBars        = 3000;   // bars per HTF engine
+input double InpCtxEffThresh   = 0.65;   // efficiency threshold
+input double InpCtxDispThresh  = 1.5;    // displacement threshold (xATR)
+input double InpCtxConvMult    = 0.01;   // convexity threshold mult (xATR)
+input int    InpCtxEffLen      = 10;     // efficiency lookback
+input double InpCtxChochBuf    = 0.75;   // CHoCH buffer (xATR)
+input bool   InpCtxReqOwner    = true;   // entry must agree with the owner curve (unless owner dying)
+input bool   InpCtxFlipGate    = true;   // buys below / sells above the HTF flip mid
+input double InpCtxFlipBufATR  = 0.30;   // flip-context buffer (xATR)
+input double InpCtxMinDom      = 45.0;   // min dominance-transfer % for a counter-owner entry (first-strike filter)
+input bool   InpCtxDeathEntry  = false;  // allow counter-trend entry when the owner is dying (>=2 death signals)
+input bool   InpCtxNewsBlock   = true;   // block entries inside the news window
+input int    InpCtxNewsH1      = 14;     // news window start hour (GMT+InpTargetGMT)
+input int    InpCtxNewsM1      = 45;
+input int    InpCtxNewsH2      = 15;     // news window end hour
+input int    InpCtxNewsM2      = 30;
+
 
 //==================================================================
 // 2. GLOBAL STATE - PHASE ENGINE
@@ -966,6 +998,298 @@ void RunProfitLadder()
 // correct mechanism for protecting captured gains.
 
 //==================================================================
+// 14B. LETRA MULTI-TF CONTEXT MODULE (LX_) — ported, self-contained
+// Computes a 6-TF structure read (M1/M3/M5/M15/H1/H4), hierarchical
+// ownership, dominance/recursion/compression, an ownership-death count,
+// the HTF flip mid, and an owner-driven destination. All outputs live in
+// g_lx* globals and are consumed only by the entry gates in ExecuteTrading.
+// Nothing here runs unless InpUseLetraCtx is true.
+//==================================================================
+#define LX_NA DBL_MAX
+bool   LX_naf(const double x){ return(x==DBL_MAX || x!=x); }
+double LX_nz(const double x,const double rep=0.0){ return(LX_naf(x)?rep:x); }
+int    LX_wdir(const double origin,const double cl,const int fb){ return(!LX_naf(origin)?(cl>origin?1:(cl<origin?-1:fb)):fb); }
+
+struct LXTF { datetime t[]; double o[],h[],l[],c[]; int n; };
+
+bool LX_LoadTF(const ENUM_TIMEFRAMES tf,const int bars,LXTF &d)
+{
+   MqlRates r[]; ArraySetAsSeries(r,false);
+   int got=CopyRates(_Symbol,tf,0,bars,r);
+   if(got<=0){ d.n=0; return false; }
+   d.n=got;
+   ArrayResize(d.t,got);ArrayResize(d.o,got);ArrayResize(d.h,got);ArrayResize(d.l,got);ArrayResize(d.c,got);
+   for(int i=0;i<got;i++){ d.t[i]=r[i].time; d.o[i]=r[i].open; d.h[i]=r[i].high; d.l[i]=r[i].low; d.c[i]=r[i].close; }
+   return true;
+}
+
+void LX_EMA(const double &src[],double &dst[],const int period)
+{
+   int n=ArraySize(src); ArrayResize(dst,n); if(n==0) return;
+   double a=2.0/(period+1.0); dst[0]=src[0];
+   for(int j=1;j<n;j++) dst[j]=dst[j-1]+a*(src[j]-dst[j-1]);
+}
+void LX_ATR(const double &h[],const double &l[],const double &c[],double &dst[],const int period)
+{
+   int n=ArraySize(c); ArrayResize(dst,n); if(n==0) return;
+   double tr,prev=0,seed=0;
+   for(int j=0;j<n;j++){
+      if(j==0) tr=h[0]-l[0];
+      else tr=MathMax(h[j]-l[j],MathMax(MathAbs(h[j]-c[j-1]),MathAbs(l[j]-c[j-1])));
+      if(j<period){ seed+=tr; dst[j]=seed/(j+1); prev=dst[j]; }
+      else { prev=(prev*(period-1)+tr)/period; dst[j]=prev; }
+   }
+}
+void LX_PivH(const double &h[],double &dst[],const int len)
+{
+   int n=ArraySize(h); ArrayResize(dst,n); ArrayInitialize(dst,LX_NA);
+   for(int j=2*len;j<n;j++){ int ctr=j-len; double v=h[ctr]; bool p=true;
+      for(int k=ctr-len;k<=ctr+len&&p;k++){ if(k==ctr) continue; if(h[k]>=v) p=false; } if(p) dst[j]=v; }
+}
+void LX_PivL(const double &l[],double &dst[],const int len)
+{
+   int n=ArraySize(l); ArrayResize(dst,n); ArrayInitialize(dst,LX_NA);
+   for(int j=2*len;j<n;j++){ int ctr=j-len; double v=l[ctr]; bool p=true;
+      for(int k=ctr-len;k<=ctr+len&&p;k++){ if(k==ctr) continue; if(l[k]<=v) p=false; } if(p) dst[j]=v; }
+}
+double LX_SumAbs(const double &c[],const int j,const int len)
+{
+   double s=0; for(int k=0;k<len;k++){ int a=j-k,b=j-k-1; if(b<0) break; s+=MathAbs(c[a]-c[b]); } return s;
+}
+int LX_MapIdx(const datetime &times[],const int n,const datetime ct)
+{
+   if(n<=0) return -1; if(times[0]>ct) return -1;
+   int lo=0,hi=n-1,res=0;
+   while(lo<=hi){ int mid=(lo+hi)>>1; if(times[mid]<=ct){ res=mid; lo=mid+1; } else hi=mid-1; }
+   return res;
+}
+double LX_MapVal(const datetime &t[],const double &v[],const int n,const datetime ct)
+{ int k=LX_MapIdx(t,n,ct); return(k<0?LX_NA:v[k]); }
+
+//--- trimmed multi-TF structure output (no phase labels exposed) ---
+struct LXSE { datetime t[]; int n;
+   double dir[],inv[],tgt[],ft[],fb[],sh[],sl[],wp[],dom[],comp[],rec[]; };
+
+LXSE lse1,lse3,lse5,lse15,lse60,lse240;
+
+//--- published context (read by ExecuteTrading gates) ---
+int    g_lxOwnerDir=0;  double g_lxOwnerDom=0.0,g_lxOwnerComp=0.0; int g_lxOwnerRec=0; int g_lxOwnerIdx=-1;
+int    g_lxMacroDir=0;  double g_lxMaxDom=0.0;  int g_lxDeath=0;
+double g_lxFlipMid=LX_NA; double g_lxTarget=LX_NA;
+
+// Faithful port of Letra's structure state machine, trimmed to the outputs
+// SYMPHONY consumes. Phase lifecycle is kept INTERNAL (for recursion/wave-
+// progress gating) but never exposed as a decision input.
+void LX_ComputeSE(const ENUM_TIMEFRAMES tf,const int bars,LXSE &O)
+{
+   LXTF d; if(!LX_LoadTF(tf,bars,d) || d.n<2*InpPivotLen+5){ O.n=0; return; }
+   int n=d.n;
+   int    pvLen=InpPivotLen, atrL=InpATRLen, effL=InpCtxEffLen;
+   double effT=InpCtxEffThresh, dispT=InpCtxDispThresh, convM=InpCtxConvMult;
+   double impM=InpImpulseAtrMult, chBuf=InpCtxChochBuf;
+
+   double diff[]; ArrayResize(diff,n); diff[0]=0; for(int j=1;j<n;j++) diff[j]=d.c[j]-d.c[j-1];
+   double vel[]; LX_EMA(diff,vel,3);
+   double acc[]; ArrayResize(acc,n); acc[0]=0; for(int j=1;j<n;j++) acc[j]=vel[j]-vel[j-1];
+   double cvx[]; ArrayResize(cvx,n); cvx[0]=0; for(int j=1;j<n;j++) cvx[j]=acc[j]-acc[j-1];
+   double csm[]; LX_EMA(cvx,csm,3);
+   double atr[]; LX_ATR(d.h,d.l,d.c,atr,atrL);
+   double phA[]; LX_PivH(d.h,phA,pvLen);
+   double plA[]; LX_PivL(d.l,plA,pvLen);
+
+   O.n=n; ArrayResize(O.t,n);
+   ArrayResize(O.dir,n);ArrayResize(O.inv,n);ArrayResize(O.tgt,n);ArrayResize(O.ft,n);ArrayResize(O.fb,n);
+   ArrayResize(O.sh,n);ArrayResize(O.sl,n);ArrayResize(O.wp,n);ArrayResize(O.dom,n);ArrayResize(O.comp,n);ArrayResize(O.rec,n);
+
+   double curSH=LX_NA,curSL=LX_NA,prSH=LX_NA,prSL=LX_NA;
+   double lastP=LX_NA,prevP=LX_NA; int lastD=0,prevD=0;
+   int    dir=0; double ftv=LX_NA,fbv=LX_NA,inv=LX_NA,tgt=LX_NA,cycH=LX_NA,cycL=LX_NA;
+   bool   bos1=false,bos2=false; double protSw=LX_NA,protSw2=LX_NA,indOrig=LX_NA; bool indBrk=false;
+   int    lastDirSeen=0,phaseState=0,recBrk=0; bool recArm=true;
+
+   for(int j=0;j<n;j++){
+      O.t[j]=d.t[j];
+      double cl=d.c[j],op=d.o[j],hi=d.h[j],lo=d.l[j],A=atr[j];
+      double mv=(j>=effL)?MathAbs(cl-d.c[j-effL]):0.0;
+      double ps=LX_SumAbs(d.c,j,effL);
+      double eff=(ps>0)?mv/ps:0.0;
+      double disp=(hi-lo)/MathMax(A,1e-10);
+      double velP=(j>0)?vel[j-1]:0, accP=(j>0)?acc[j-1]:0;
+      bool bullImp=eff>effT && vel[j]>velP && acc[j]>0 && cl>op && disp>dispT;
+      bool bearImp=eff>effT && vel[j]<velP && acc[j]<0 && cl<op && disp>dispT;
+      bool bullDec=MathAbs(acc[j])<MathAbs(accP)*0.8 && vel[j]>0;
+      bool bearDec=MathAbs(acc[j])<MathAbs(accP)*0.8 && vel[j]<0;
+      double pH=phA[j], pL=plA[j];
+      if(!LX_naf(pH)){ prSH=LX_naf(curSH)?pH:curSH; curSH=pH; }
+      if(!LX_naf(pL)){ prSL=LX_naf(curSL)?pL:curSL; curSL=pL; }
+      double eP=LX_NA; int eD=0;
+      if(!LX_naf(pH)){ eP=pH; eD=1; } else if(!LX_naf(pL)){ eP=pL; eD=-1; }
+      if(eD!=0){ prevP=lastP; prevD=lastD; lastP=eP; lastD=eD; }
+      bool bullBOS=!LX_naf(prSH)&&cl>prSH;
+      bool bearBOS=!LX_naf(prSL)&&cl<prSL;
+      bool bullCH =!LX_naf(prSH)&&cl>prSH+A*chBuf;
+      bool bearCH =!LX_naf(prSL)&&cl<prSL-A*chBuf;
+      bool eLong =!LX_naf(pH)&&prevD==-1&&(pH-prevP)>A*impM;
+      bool eShort=!LX_naf(pL)&&prevD==1 &&(prevP-pL)>A*impM;
+      bool hasCtx=dir!=0&&!LX_naf(ftv);
+      bool flipDn=dir==1 && bearCH;
+      bool flipUp=dir==-1&& bullCH;
+      bool isRev=(eLong&&dir==-1)||(eShort&&dir==1)||flipUp||flipDn;
+      bool spawn=(eLong||eShort||flipUp||flipDn)&&(!hasCtx||isRev);
+      if(spawn){
+         int nd=eLong?1:eShort?-1:flipUp?1:-1;
+         double _hi=MathMax(lastP,prevP), _lo=MathMin(lastP,prevP);
+         dir=nd; ftv=_hi; fbv=_lo; cycH=hi; cycL=lo;
+         inv = nd==1?_lo:_hi;
+         double rng=(!LX_naf(prSH)&&!LX_naf(prSL))?MathAbs(prSH-prSL):A*5.0;
+         tgt = nd==1? LX_nz(_hi,cl)+rng : LX_nz(_lo,cl)-rng;
+      }
+      if(dir==1)  cycH=LX_naf(cycH)?hi:MathMax(cycH,hi);
+      if(dir==-1) cycL=LX_naf(cycL)?lo:MathMin(cycL,lo);
+
+      bool reset=(dir!=lastDirSeen); lastDirSeen=dir;
+      if(reset){ bos1=false; bos2=false; protSw=LX_NA; protSw2=LX_NA; indOrig=LX_NA; indBrk=false; }
+      if(dir==1 && !LX_naf(pL)){ protSw2=protSw; protSw=pL; }
+      if(dir==-1 && !LX_naf(pH)){ protSw2=protSw; protSw=pH; }
+      bool oppBOS=(dir==1&&!LX_naf(protSw)&&cl<protSw)||(dir==-1&&!LX_naf(protSw)&&cl>protSw);
+      if(!bos1 && oppBOS){ bos1=true; indOrig=dir==1?LX_nz(cycH,hi):LX_nz(cycL,lo); }
+      if(bos1 && !bos2 && oppBOS && !LX_naf(protSw2) && (dir==1?cl<protSw2:cl>protSw2)) bos2=true;
+      if(bos2 && !LX_naf(indOrig)){ if(dir==1&&cl>indOrig) indBrk=true; if(dir==-1&&cl<indOrig) indBrk=true; }
+
+      double convScore=MathMin(MathAbs(csm[j])/MathMax(A*convM,1e-10)*50.0,100.0);
+      double expScore =MathMin(eff/MathMax(effT,1e-10)*50.0+disp/MathMax(dispT,1e-10)*50.0,100.0);
+      double absScore =(eff<effT*0.7 && MathAbs(vel[j])<MathAbs(velP)*0.6)?60.0+convScore*0.4:convScore*0.3;
+      bool momExpStrong=eff>effT*0.75 && (dir==1?vel[j]>0:vel[j]<0);
+      bool momDecaying =dir==1?bullDec:bearDec;
+      bool momCounter  =dir==1?bearImp:bullImp;
+      bool momExhaust  =eff<effT*0.65 && absScore>40.0;
+      bool physConvexDevel=convScore>35.0;
+      bool physTransfer   =convScore>48.0 || absScore>40.0;
+      int wdir = !LX_naf(inv)?(cl>inv?1:(cl<inv?-1:dir)):dir;
+      bool atFlip=!LX_naf(ftv)&&!LX_naf(fbv)&&cl<=ftv&&cl>=fbv;
+      bool expanding=momExpStrong||eLong||eShort||(wdir==1?bullImp:bearImp);
+      bool atExtreme=wdir==1?hi>=LX_nz(cycH,hi):(wdir==-1?lo<=LX_nz(cycL,lo):false);
+      double extr=wdir==1?LX_nz(cycH,cl):LX_nz(cycL,cl);
+      bool extended=!LX_naf(inv)&&MathAbs(extr-inv)>A*1.5;
+      double fzMid=(!LX_naf(ftv)&&!LX_naf(fbv))?(ftv+fbv)/2.0:LX_NA;
+      double retrFrac=(!LX_naf(fzMid)&&MathAbs(extr-fzMid)>1e-10)?MathAbs(extr-cl)/MathAbs(extr-fzMid):0.0;
+      double compIdx=MathMin(100.0,MathMax(0.0,(1.0-MathMin(disp/MathMax(dispT,1e-10),1.0))*60.0+(1.0-MathMin(eff/MathMax(effT,1e-10),1.0))*40.0));
+      bool phase2CH=(dir==1&&bearCH)||(dir==-1&&bullCH);
+      if(reset||(atExtreme&&extended)){ recBrk=0; recArm=true; }
+      if((dir==1&&!LX_naf(pH))||(dir==-1&&!LX_naf(pL))) recArm=true;
+      if((phase2CH||oppBOS)&&recArm&&!atExtreme){ recBrk++; recArm=false; }
+      int recRequired = compIdx>=80 ? 5 : compIdx>=55 ? 4 : compIdx>=30 ? 3 : 1;
+      double recDom=MathMin(100.0,MathMax(recBrk*(30.0-compIdx*0.15),retrFrac*80.0));
+      bool energyExhausted = momExhaust || (eff<effT*0.6 && MathAbs(vel[j])<MathAbs(velP)*0.5);
+      bool transferDone = recDom>=50.0 && (recBrk>=recRequired) && (energyExhausted || recDom>=75.0);
+      if(reset) phaseState=0;
+      if(dir!=0 && !reset){
+         if(phaseState==0 && expanding) phaseState=1;
+         if(phaseState==1 && !atExtreme && momDecaying && physConvexDevel) phaseState=2;
+         if(phaseState==2 && !atExtreme && momCounter && physTransfer) phaseState=3;
+         if(phaseState==3 && !atExtreme && (bos1||bos2||indBrk) && physTransfer) phaseState=4;
+         if(phaseState>=1 && phaseState<=7 && atExtreme && extended) phaseState=5;
+         if(phaseState==5 && !atExtreme && (recBrk>=1||momExhaust)) phaseState=7;
+         if(phaseState==7 && transferDone) phaseState=8;
+         if(phaseState==8 && atFlip) phaseState=9;
+         if(phaseState==9 && ((dir==1&&bullImp)||(dir==-1&&bearImp))) phaseState=10;
+         if(phaseState==10 && (oppBOS)) phaseState=11;
+         if(phaseState==11 && ((dir==1&&lo<fbv)||(dir==-1&&hi>ftv))) phaseState=12;
+         if(phaseState==12 && ((dir==1&&bullCH)||(dir==-1&&bearCH))) phaseState=13;
+      }
+      double wp = phaseState==0?5.0:phaseState==1?15.0:phaseState==2?25.0:phaseState==3?33.0:phaseState==4?42.0:phaseState==5?55.0:phaseState==7?65.0:phaseState==8?75.0:phaseState==9?85.0:phaseState==10?90.0:phaseState==11?94.0:phaseState==12?97.0:100.0;
+      int dirLabel = !LX_naf(inv)?(cl>inv?1:(cl<inv?-1:dir)):dir;
+
+      O.dir[j]=dirLabel; O.inv[j]=inv; O.tgt[j]=tgt; O.ft[j]=ftv; O.fb[j]=fbv;
+      O.sh[j]=curSH; O.sl[j]=curSL; O.wp[j]=wp; O.dom[j]=recDom; O.comp[j]=compIdx; O.rec[j]=(double)recBrk;
+   }
+}
+
+// Build the published context from the 6 timeframe engines. Runs on a new bar.
+void LX_BuildContext()
+{
+   if(!InpUseLetraCtx) return;
+   LX_ComputeSE(PERIOD_M1, InpCtxBars, lse1);
+   LX_ComputeSE(PERIOD_M3, InpCtxBars, lse3);
+   LX_ComputeSE(PERIOD_M5, InpCtxBars, lse5);
+   LX_ComputeSE(PERIOD_M15,InpCtxBars, lse15);
+   LX_ComputeSE(PERIOD_H1, InpCtxBars, lse60);
+   LX_ComputeSE(PERIOD_H4, InpCtxBars, lse240);
+
+   int barsAvail=(int)ArraySize(Close);
+   if(barsAvail<3) return;
+   datetime ct=Time[1];
+   double   cl=Close[1];
+
+   // gather per-TF values, index 0=M1 .. 5=H4
+   double rdir[6],dm[6],cmp[6],rc[6],wp[6],iv[6],ft[6],fb[6],tg[6]; int dr[6];
+   LXSE  ses[6]; ses[0]=lse1; ses[1]=lse3; ses[2]=lse5; ses[3]=lse15; ses[4]=lse60; ses[5]=lse240;
+   double tfW[6]; tfW[0]=0.20; tfW[1]=0.35; tfW[2]=0.55; tfW[3]=0.70; tfW[4]=0.85; tfW[5]=1.0;
+
+   for(int k=0;k<6;k++){
+      rdir[k]=LX_nz(LX_MapVal(ses[k].t,ses[k].dir,ses[k].n,ct));
+      iv[k]  =LX_MapVal(ses[k].t,ses[k].inv,ses[k].n,ct);
+      dm[k]  =LX_nz(LX_MapVal(ses[k].t,ses[k].dom,ses[k].n,ct));
+      cmp[k] =LX_nz(LX_MapVal(ses[k].t,ses[k].comp,ses[k].n,ct));
+      rc[k]  =LX_nz(LX_MapVal(ses[k].t,ses[k].rec,ses[k].n,ct));
+      wp[k]  =LX_nz(LX_MapVal(ses[k].t,ses[k].wp,ses[k].n,ct));
+      ft[k]  =LX_MapVal(ses[k].t,ses[k].ft,ses[k].n,ct);
+      fb[k]  =LX_MapVal(ses[k].t,ses[k].fb,ses[k].n,ct);
+      tg[k]  =LX_MapVal(ses[k].t,ses[k].tgt,ses[k].n,ct);
+      dr[k]  =LX_wdir(iv[k],cl,(int)rdir[k]);
+   }
+
+   // --- Hierarchical Ownership (phase-agnostic): dir-alive * dom * wp * tfWeight ---
+   double bestW=-1.0; int own=-1;
+   for(int k=0;k<6;k++){
+      double w=(dr[k]!=0?1.0:0.01)*MathMax(dm[k],5.0)/100.0*MathMax(wp[k],5.0)/100.0*tfW[k];
+      if(w>bestW){ bestW=w; own=k; }
+   }
+   g_lxOwnerIdx=own;
+   g_lxOwnerDir =(own>=0?dr[own]:0);
+   g_lxOwnerDom =(own>=0?dm[own]:0.0);
+   g_lxOwnerComp=(own>=0?cmp[own]:0.0);
+   g_lxOwnerRec =(own>=0?(int)rc[own]:0);
+
+   // --- macro direction + max dominance across the stack ---
+   g_lxMacroDir=(dr[5]!=0?dr[5]:(dr[4]!=0?dr[4]:dr[2]));
+   double maxDom=0.0; for(int k=0;k<6;k++) if(dm[k]>maxDom) maxDom=dm[k];
+   g_lxMaxDom=maxDom;
+
+   // --- Ownership-Death (3-signal): SE dom, LTF reversal, HOE opposing weight ---
+   double macroDom=(dr[5]!=0?dm[5]:(dr[4]!=0?dm[4]:dm[2]));
+   bool ds1=(macroDom>40.0);
+   int ltfAgainst=0;
+   if(dr[0]!=0 && dr[0]!=g_lxMacroDir) ltfAgainst++;
+   if(dr[1]!=0 && dr[1]!=g_lxMacroDir) ltfAgainst++;
+   if(dr[2]!=0 && dr[2]!=g_lxMacroDir) ltfAgainst++;
+   if(dr[3]!=0 && dr[3]!=g_lxMacroDir) ltfAgainst++;
+   if(dr[4]!=0 && dr[4]!=g_lxMacroDir && g_lxMacroDir==dr[5]) ltfAgainst++;
+   bool ds2=(ltfAgainst>=2);
+   int oppDir=-g_lxMacroDir; double oppW=0.0,totW=0.0;
+   for(int k=0;k<6;k++){ totW+=tfW[k]; if(dr[k]==oppDir) oppW+=tfW[k]; }
+   bool ds3=(totW>0 && (oppW/totW)>0.30);
+   g_lxDeath=(ds1?1:0)+(ds2?1:0)+(ds3?1:0);
+
+   // --- HTF flip mid (H4 > H1 > M15) ---
+   g_lxFlipMid=LX_NA;
+   for(int k=5;k>=3;k--){
+      if(!LX_naf(ft[k])&&!LX_naf(fb[k])){ g_lxFlipMid=(ft[k]+fb[k])/2.0; break; }
+   }
+
+   // --- Owner-Driven Destination (ODDE): owner's opposing flip, else owner target ---
+   g_lxTarget=LX_NA;
+   if(g_lxOwnerDir==-1){
+      for(int k=5;k>=0;k--){ if(dr[k]==1 && !LX_naf(ft[k]) && ft[k]<cl){ g_lxTarget=ft[k]; break; } }
+      if(LX_naf(g_lxTarget) && own>=0 && !LX_naf(tg[own]) && tg[own]<cl) g_lxTarget=tg[own];
+   } else if(g_lxOwnerDir==1){
+      for(int k=5;k>=0;k--){ if(dr[k]==-1 && !LX_naf(fb[k]) && fb[k]>cl){ g_lxTarget=fb[k]; break; } }
+      if(LX_naf(g_lxTarget) && own>=0 && !LX_naf(tg[own]) && tg[own]>cl) g_lxTarget=tg[own];
+   }
+}
+
+
+//==================================================================
 // 15. TRADING EXECUTION
 // Pre-entry basket ceiling applied before every OrderSend.
 // No trimming needed: if the ceiling is reached, entry is skipped.
@@ -1000,6 +1324,36 @@ void ExecuteTrading()
    bool longBookProfitable  = (GetDirectionFloatingPnL( 1) > 0.0);
    if(shortBookProfitable) { L3 = false; L4 = false; }
    if(longBookProfitable)  { S3 = false; S4 = false; }
+
+   // ===== LETRA MULTI-TF CONTEXT GATES (default off via InpUseLetraCtx) =====
+   // Applied on top of SYMPHONY's own phase entries. Only ever DISABLES a
+   // candidate entry; never creates one. Provides the HTF awareness SYMPHONY
+   // lacks (owner direction, flip-context, dominance transfer, news window).
+   if(InpUseLetraCtx)
+   {
+      // 1) HTF flip-context: buys only below the flip mid, sells only above.
+      if(InpCtxFlipGate && !LX_naf(g_lxFlipMid)){
+         if(closeNow > g_lxFlipMid + atrNow*InpCtxFlipBufATR){ L3=false; L4=false; } // above flip = sell territory
+         if(closeNow < g_lxFlipMid - atrNow*InpCtxFlipBufATR){ S3=false; S4=false; } // below flip = buy territory
+      }
+      // 2) Owner agreement: don't fight the owner curve (unless it is dying and death entries are allowed).
+      if(InpCtxReqOwner){
+         bool ownerLongOK  = (g_lxOwnerDir==1)  || (g_lxOwnerDir==0) || (InpCtxDeathEntry && g_lxDeath>=2 && g_lxMacroDir==-1);
+         bool ownerShortOK = (g_lxOwnerDir==-1) || (g_lxOwnerDir==0) || (InpCtxDeathEntry && g_lxDeath>=2 && g_lxMacroDir==1);
+         if(!ownerLongOK){ L3=false; L4=false; }
+         if(!ownerShortOK){ S3=false; S4=false; }
+      }
+      // 3) Dominance / first-strike: a counter-owner entry needs transferred dominance OR owner death.
+      if(g_lxOwnerDir==-1 && g_lxMaxDom<InpCtxMinDom && g_lxDeath<2){ L3=false; L4=false; }
+      if(g_lxOwnerDir==1  && g_lxMaxDom<InpCtxMinDom && g_lxDeath<2){ S3=false; S4=false; }
+      // 4) News-window block (GMT + InpTargetGMT).
+      if(InpCtxNewsBlock){
+         MqlDateTime _dt; TimeGMT(_dt);
+         int _h=_dt.hour+InpTargetGMT; if(_h<0) _h+=24; if(_h>=24) _h-=24; int _m=_dt.min;
+         bool _news=((_h==InpCtxNewsH1 && _m>=InpCtxNewsM1)||(_h==InpCtxNewsH2 && _m<=InpCtxNewsM2));
+         if(_news){ L3=false; L4=false; S3=false; S4=false; }
+      }
+   }
 
    // --- LONG P3 ---
    if(L3 && g_lastLongTradeTime != barTime)
@@ -1242,6 +1596,9 @@ void OnTick()
 
    // 2. Update ARC target
    UpdateARC();
+
+   // 2B. Letra multi-TF context (default off) — 6-TF ownership / flip / dominance / death / ODDE
+   LX_BuildContext();
 
    // 3. Profit ladder and trailing stop protection
    RunStopProtection();

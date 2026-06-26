@@ -118,7 +118,7 @@ input int    InpTargetGMT         = 0;      // Session GMT offset
 //   - News-window block
 // Default OFF — flip InpUseLetraCtx to true to A/B test.
 //==================================================================
-input bool   InpUseLetraCtx    = false;  // MASTER: compute Letra 6-TF context + apply entry gates
+input bool   InpUseLetraCtx    = true;   // MASTER: compute Letra 6-TF context + apply entry gates
 input int    InpCtxBars        = 3000;   // bars per HTF engine
 input double InpCtxEffThresh   = 0.65;   // efficiency threshold
 input double InpCtxDispThresh  = 1.5;    // displacement threshold (xATR)
@@ -129,7 +129,7 @@ input bool   InpCtxReqOwner    = true;   // entry must agree with the owner curv
 input bool   InpCtxFlipGate    = true;   // buys below / sells above the HTF flip mid
 input double InpCtxFlipBufATR  = 0.30;   // flip-context buffer (xATR)
 input double InpCtxMinDom      = 45.0;   // min dominance-transfer % for a counter-owner entry (first-strike filter)
-input bool   InpCtxDeathEntry  = false;  // allow counter-trend entry when the owner is dying (>=2 death signals)
+input bool   InpCtxDeathEntry  = true;   // allow counter-trend entry when the owner is dying (>=2 death signals)
 input bool   InpCtxNewsBlock   = true;   // block entries inside the news window
 input int    InpCtxNewsH1      = 14;     // news window start hour (GMT+InpTargetGMT)
 input int    InpCtxNewsM1      = 45;

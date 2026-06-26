@@ -225,6 +225,7 @@ struct CurvState
    double   prevVel;      // velocity (1st derivative) at previous sample
    double   peakPnL;      // high-water mark of smoothed PnL
    double   armRisk;      // basket risk snapshot taken when armed
+   double   lastVolume;   // total direction volume at last sample (discontinuity guard)
    datetime lastSample;   // time of last accepted sample (sampling cadence)
    datetime lastFire;     // time of last exit (cooldown)
    int      samples;      // samples collected since flat (warm-up counter)
@@ -1034,6 +1035,27 @@ int CountDirectionPositions(int direction)
    return c;
 }
 
+// Total open volume (lots) in a direction. Used to detect PnL
+// discontinuities caused by ladder closes or new entries — those
+// step-change the floating PnL for reasons unrelated to price, and
+// must NOT be read as curvature.
+double GetDirectionVolume(int direction)
+{
+   double vol = 0.0;
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if((type == POSITION_TYPE_BUY ? 1 : -1) != direction) continue;
+      vol += PositionGetDouble(POSITION_VOLUME);
+   }
+   return vol;
+}
+
 // Basket dollar-risk with a 1-ATR floor per leg.
 // GetBasketDollarRisk() returns 0 once stops sit at break-even
 // (distSL collapses to 0), which would make the R-multiple arm
@@ -1093,6 +1115,7 @@ void ResetCurvState(CurvState &st)
    st.prevVel    = 0.0;
    st.peakPnL    = 0.0;
    st.armRisk    = 0.0;
+   st.lastVolume = 0.0;
    st.lastSample = 0;
    st.samples    = 0;
    st.decelCount = 0;
@@ -1110,12 +1133,14 @@ void UpdateCurvatureDirection(int direction, CurvState &st, datetime now)
 
    double pnl   = GetDirectionFloatingPnL(direction);
    double risk  = GetBasketDollarRiskFloored(direction);
+   double curVol = GetDirectionVolume(direction);
    double alpha = 2.0 / (InpCurvEmaPeriod + 1.0);
 
    // Seed the smoother on the first sample of a fresh campaign.
    if(st.samples == 0)
    {
       st.emaPnL = pnl; st.prevEmaPnL = pnl; st.prevVel = 0.0; st.peakPnL = pnl;
+      st.lastVolume = curVol;
    }
    else
    {
@@ -1131,6 +1156,27 @@ void UpdateCurvatureDirection(int direction, CurvState &st, datetime now)
       st.armed   = true;
       st.armRisk = risk;
    }
+
+   // --- DISCONTINUITY GUARD ---
+   // A ladder partial-close or a new entry step-changes floating PnL for
+   // reasons that have nothing to do with price curvature. If volume moved
+   // since the last sample, re-baseline the smoother and skip derivative
+   // logic this tick — otherwise the artificial PnL jump reads as a fake
+   // peak and dumps the runners right after every rung.
+   double volStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(st.samples > 0 && MathAbs(curVol - st.lastVolume) > (volStep * 0.5))
+   {
+      st.emaPnL     = pnl;
+      st.prevEmaPnL = pnl;
+      st.prevVel    = 0.0;
+      st.peakPnL    = pnl;     // rebase peak to the new (post-size-change) scale
+      st.decelCount = 0;
+      st.lastVolume = curVol;
+      st.lastSample = now;
+      st.samples++;
+      return;                  // do not evaluate curvature across the jump
+   }
+   st.lastVolume = curVol;
 
    // First and second derivatives of the smoothed PnL curve.
    double vel   = st.emaPnL - st.prevEmaPnL;   // d(PnL)/dt

@@ -122,11 +122,12 @@ input int    InpTargetGMT         = 0;      // Session GMT offset
 //  - A fresh push up (vel>0) resets the watch — it rides the trend.
 //==================================================================
 input bool   InpUseCurvatureExit  = true;   // Enable PnL-curvature peak exit
-input int    InpCurvSampleSecs     = 2;      // Min seconds between PnL samples (fixed dt)
-input int    InpCurvEmaPeriod      = 6;      // EMA period that smooths basket PnL
-input double InpCurvArmR           = 0.8;    // Arm peak-watch once PnL >= this x basket risk
-input int    InpCurvConfirmTicks   = 3;      // Consecutive decelerating samples to confirm peak
-input double InpCurvGivebackR       = 0.0;    // Extra confirm: PnL must fall this x risk below peak (0 = pure curvature)
+input int    InpCurvSampleSecs     = 5;      // Min seconds between PnL samples (fixed dt)
+input int    InpCurvEmaPeriod      = 12;     // EMA period that smooths basket PnL
+input double InpCurvArmR           = 1.5;    // Arm peak-watch once PnL >= this x basket risk
+input int    InpCurvConfirmTicks   = 4;      // Consecutive decelerating samples to confirm peak
+input double InpCurvGivebackR       = 0.5;    // PnL must fall this x risk below peak before exit (0 = fire at inflection)
+input double InpCurvVelCollapse     = 0.25;   // Downward speed must reach this x the prior up-thrust (0 = any down-tick)
 input double InpCurvCloseFrac       = 1.0;    // Fraction of direction book to close at peak (1.0 = all)
 
 
@@ -224,6 +225,7 @@ struct CurvState
    double   prevEmaPnL;   // smoothed PnL at previous sample
    double   prevVel;      // velocity (1st derivative) at previous sample
    double   peakPnL;      // high-water mark of smoothed PnL
+   double   peakVel;      // peak upward velocity (thrust) seen since arming
    double   armRisk;      // basket risk snapshot taken when armed
    double   lastVolume;   // total direction volume at last sample (discontinuity guard)
    datetime lastSample;   // time of last accepted sample (sampling cadence)
@@ -1114,6 +1116,7 @@ void ResetCurvState(CurvState &st)
    st.prevEmaPnL = 0.0;
    st.prevVel    = 0.0;
    st.peakPnL    = 0.0;
+   st.peakVel    = 0.0;
    st.armRisk    = 0.0;
    st.lastVolume = 0.0;
    st.lastSample = 0;
@@ -1171,6 +1174,7 @@ void UpdateCurvatureDirection(int direction, CurvState &st, datetime now)
       st.prevVel    = 0.0;
       st.peakPnL    = pnl;     // rebase peak to the new (post-size-change) scale
       st.decelCount = 0;
+      st.peakVel    = 0.0;
       st.lastVolume = curVol;
       st.lastSample = now;
       st.samples++;
@@ -1182,6 +1186,11 @@ void UpdateCurvatureDirection(int direction, CurvState &st, datetime now)
    double vel   = st.emaPnL - st.prevEmaPnL;   // d(PnL)/dt
    double accel = vel - st.prevVel;            // d2(PnL)/dt2
 
+   // Track the strongest upward thrust seen during this run. The exit
+   // later demands that downward speed reach a fraction of this thrust,
+   // so a flat spot in a powerful trend is not mistaken for the top.
+   if(vel > st.peakVel) st.peakVel = vel;
+
    // Peak signature: profit no longer rising AND decelerating.
    // A fresh upward push cancels the watch so the engine rides trends.
    if(st.armed && st.samples >= 3 && vel <= 0.0 && accel < 0.0)
@@ -1189,19 +1198,32 @@ void UpdateCurvatureDirection(int direction, CurvState &st, datetime now)
    else if(vel > 0.0)
       st.decelCount = 0;
 
-   // Optional give-back confirmation (0 = pure curvature, fire at the inflection).
    double refRisk = (st.armRisk > 0.0 ? st.armRisk : risk);
+
+   // GIVE-BACK GATE — the primary "don't exit too early" filter.
+   // Do not exit at the inflection; wait until the smoothed PnL has
+   // actually retreated GivebackR x risk from its high-water mark.
+   // Minor pauses never retreat this far, so they are ignored; only a
+   // real rollover qualifies. (0 disables → fire at the inflection.)
    bool givebackOK = (InpCurvGivebackR <= 0.0) ||
                      (refRisk > 0.0 && (st.peakPnL - st.emaPnL) >= InpCurvGivebackR * refRisk);
 
+   // VELOCITY-COLLAPSE GATE — downward speed must be a real fraction of
+   // the prior up-thrust, i.e. momentum genuinely reversed rather than
+   // just stalled. (0 disables → any down-tick qualifies.)
+   bool velCollapseOK = (InpCurvVelCollapse <= 0.0) || (st.peakVel <= 0.0) ||
+                        (vel <= -InpCurvVelCollapse * st.peakVel);
+
    bool cooldownOK = (st.lastFire == 0 || (now - st.lastFire) > 30);
 
-   if(st.armed && st.decelCount >= InpCurvConfirmTicks && givebackOK && cooldownOK)
+   if(st.armed && st.decelCount >= InpCurvConfirmTicks
+      && givebackOK && velCollapseOK && cooldownOK)
    {
       Print("SYM CURV EXIT ", (direction > 0 ? "LONG" : "SHORT"),
             " peak=",  DoubleToString(st.peakPnL, 2),
             " now=",   DoubleToString(st.emaPnL, 2),
             " vel=",   DoubleToString(vel, 2),
+            " peakVel=", DoubleToString(st.peakVel, 2),
             " accel=", DoubleToString(accel, 2),
             " decel=", st.decelCount);
       CloseDirectionFraction(direction, InpCurvCloseFrac, "SYM CURV PEAK");
@@ -1210,6 +1232,7 @@ void UpdateCurvatureDirection(int direction, CurvState &st, datetime now)
       st.armed      = false;
       st.decelCount = 0;
       st.peakPnL    = st.emaPnL;
+      st.peakVel    = 0.0;
    }
 
    // Advance the sample window.

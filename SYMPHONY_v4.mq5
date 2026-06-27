@@ -93,6 +93,7 @@ input bool   InpShowDashboard     = true;   // Print Comment() dashboard
 // --- curve-tree entry gate + all-timeframe entries (LIFE NOT USED FOR ENTRIES) ---
 input bool   InpRequireCurveOwner = true;   // Require curve-tree owner not opposed to the entry dir
 input bool   InpUsePhaseInNode    = true;   // Feed phase context into curve-tree node state
+input bool   InpBlockCounterProfit= true;   // Don't open one side while the OTHER book is net profitable
 input bool   InpTradeAllTF        = true;   // Fire P3/P4 from every timeframe curve (not just chart)
 input int    InpEntryFromTFIndex  = 0;      // Lowest entry timeframe (0=M1 1=M5 2=M15 3=H1 4=H4 5=D1)
 
@@ -1728,7 +1729,8 @@ void ManageExits()
 //   Each entry must pass the CURVE-TREE gate: the curve tree's OWNER
 //   node must not be opposed to the entry direction. Phases trigger;
 //   the curve tree (ownership) confirms. LIFE IS NOT USED FOR ENTRIES
-//   — life only manages exits. No counter-direction block.
+//   — life only manages exits. Counter-direction block: a side is held
+//   back while the OPPOSITE book is net profitable (InpBlockCounterProfit).
 //==================================================================
 bool CurveAllowsLong()
 {
@@ -1793,22 +1795,29 @@ void ExecuteTrading()
    double equity   = AccountInfoDouble(ACCOUNT_EQUITY);
    double riskCash = equity * InpRiskPercent * 0.01;
 
+   // COUNTER-DIRECTION BLOCK: don't open longs while the short book is net
+   // profitable (and vice versa). A counter-trend bounce inside a running
+   // profitable campaign is noise, not a new campaign — opening against a
+   // profitable book bleeds net P&L. Toggle with InpBlockCounterProfit.
+   bool blockLong  = InpBlockCounterProfit && (GetDirectionFloatingPnL(-1) > 0.0);
+   bool blockShort = InpBlockCounterProfit && (GetDirectionFloatingPnL(1)  > 0.0);
+
    if(!InpTradeAllTF)
    {
       // single chart-matching rung only
       int ci = -1;
       for(int i = 0; i < 6; i++) if(g_mtfTF[i] == _Period) { ci = i; break; }
       if(ci < 0) ci = 2;   // fallback to M15
-      TryEnterLongTF(ci, riskCash);
-      TryEnterShortTF(ci, riskCash);
+      if(!blockLong)  TryEnterLongTF(ci, riskCash);
+      if(!blockShort) TryEnterShortTF(ci, riskCash);
       return;
    }
 
    int start = (InpEntryFromTFIndex < 0) ? 0 : (InpEntryFromTFIndex > 5 ? 5 : InpEntryFromTFIndex);
    for(int i = start; i <= 5; i++)
    {
-      TryEnterLongTF(i, riskCash);
-      TryEnterShortTF(i, riskCash);
+      if(!blockLong)  TryEnterLongTF(i, riskCash);
+      if(!blockShort) TryEnterShortTF(i, riskCash);
    }
 }
 

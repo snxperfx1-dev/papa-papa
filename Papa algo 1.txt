@@ -135,6 +135,14 @@ input int    InpCtxNewsH1      = 14;     // news window start hour (GMT+InpTarge
 input int    InpCtxNewsM1      = 45;
 input int    InpCtxNewsH2      = 15;     // news window end hour
 input int    InpCtxNewsM2      = 30;
+//--- Phase 2 (A/B tier): extra engines. Restrictive gates default OFF. ---
+input double InpCtxFuWick       = 0.30;   // FU spike: min wick / range
+input bool   InpCtxAvoidManip   = false;  // GATE: block entries inside the 0.618-0.786 manipulation band
+input int    InpCtxMinShifts     = 0;      // GATE: require N Wyckoff terminal shifts at the flip (0=off)
+input double InpCtxMinEntryProb  = 0.0;    // GATE: require entry-probability % (0=off)
+input bool   InpCtxMomFlip       = false;  // GATE: require M5 momentum into the trade direction
+input bool   InpCtxFractalAgree  = false;  // GATE: require the fractal stack to agree with the trade
+input bool   InpCtxHuntMode      = false;  // OPP: Layer-2 continuation re-entries at demand/supply
 
 
 //==================================================================
@@ -1290,6 +1298,206 @@ void LX_BuildContext()
 
 
 //==================================================================
+// 14C. LETRA PHASE-2 ENGINES (A/B tier) — context + opportunity
+// Physics, fractal stack, geometry, compression->recursion, true-induction
+// vs manipulation band, failure-swing, Wyckoff terminal shift counter,
+// curve life, TIE cycle stack, EPE-lite entry probability, FU pools.
+// Everything is published to g_lx* globals; restrictive gates are opt-in.
+//==================================================================
+
+//--- Phase-2 published outputs ---
+int    g_lxStackDir=0;    double g_lxStackPct=0.0;
+double g_lxDistFlipAtr=5.0, g_lxFlipWidthAtr=0.0;
+int    g_lxExpRec=0;      string g_lxCompReg="-";
+double g_lxLowestFlip=LX_NA; bool g_lxAtTrueInduction=false;
+bool   g_lxInManipBand=false;
+bool   g_lxFailureSwing=false;
+int    g_lxTermShifts=0,g_lxTermExpected=4; bool g_lxTermComplete=false;
+double g_lxLife=50.0;
+int    g_lxTimeDir=0;     double g_lxTimeAlign=50.0;
+double g_lxEntryProb=0.0;
+double g_lxVel=0.0; bool g_lxImpBull=false,g_lxImpBear=false;
+bool   g_lxFuFresh=false; int g_lxFuDir=0; double g_lxFuTip=LX_NA,g_lxFuTarget=LX_NA;
+//--- persistent Wyckoff terminal state ---
+bool   g_lxTermActive=false; int g_lxTermPrevDir=0;
+
+// ---- A7: Physics substrate (M5) -> velocity + impulse flags ----
+void LX_Physics()
+{
+   g_lxVel=0.0; g_lxImpBull=false; g_lxImpBear=false;
+   LXTF d; if(!LX_LoadTF(PERIOD_M5,InpCtxBars,d) || d.n<InpCtxEffLen+5) return;
+   int n=d.n;
+   double diff[]; ArrayResize(diff,n); diff[0]=0; for(int j=1;j<n;j++) diff[j]=d.c[j]-d.c[j-1];
+   double vel[]; LX_EMA(diff,vel,3);
+   double acc[]; ArrayResize(acc,n); acc[0]=0; for(int j=1;j<n;j++) acc[j]=vel[j]-vel[j-1];
+   double atr[]; LX_ATR(d.h,d.l,d.c,atr,InpATRLen);
+   int j=n-2; if(j<InpCtxEffLen) return;
+   double cl=d.c[j],op=d.o[j],hi=d.h[j],lo=d.l[j],A=atr[j];
+   double velP=vel[j-1];
+   double mv=MathAbs(cl-d.c[j-InpCtxEffLen]);
+   double ps=LX_SumAbs(d.c,j,InpCtxEffLen);
+   double eff=(ps>0)?mv/ps:0.0;
+   double disp=(hi-lo)/MathMax(A,1e-10);
+   g_lxVel=vel[j];
+   g_lxImpBull=(eff>InpCtxEffThresh && vel[j]>velP && acc[j]>0 && cl>op && disp>InpCtxDispThresh);
+   g_lxImpBear=(eff>InpCtxEffThresh && vel[j]<velP && acc[j]<0 && cl<op && disp>InpCtxDispThresh);
+}
+
+// ---- A14: FU pool last-state for one TF ----
+void LX_FUlast(const ENUM_TIMEFRAMES tf,int &dir,double &tip,double &mid,double &pool,bool &valid)
+{
+   dir=0; tip=LX_NA; mid=LX_NA; pool=LX_NA; valid=false;
+   LXTF d; if(!LX_LoadTF(tf,InpCtxBars,d) || d.n<6) return;
+   int n=d.n;
+   double tipv=LX_NA,bH=LX_NA,bL=LX_NA,poolv=LX_NA; int dr=0; bool vld=false;
+   for(int j=3;j<n;j++){
+      double cl=d.c[j],op=d.o[j],hi=d.h[j],lo=d.l[j];
+      double rng=MathMax(hi-lo,1e-10);
+      double priorHi=-DBL_MAX; for(int k=1;k<=3;k++){ int idx=j-k; if(idx<0) break; if(d.h[idx]>priorHi) priorHi=d.h[idx]; }
+      double priorLo= DBL_MAX; for(int k=1;k<=3;k++){ int idx=j-k; if(idx<0) break; if(d.l[idx]<priorLo) priorLo=d.l[idx]; }
+      bool bear=(priorHi>-DBL_MAX) && hi>priorHi && cl<priorHi && (hi-MathMax(op,cl))/rng>=InpCtxFuWick;
+      bool bull=(priorLo< DBL_MAX) && lo<priorLo && cl>priorLo && (MathMin(op,cl)-lo)/rng>=InpCtxFuWick;
+      if(bear){ dr=-1; tipv=hi; bH=MathMax(op,cl); bL=MathMin(op,cl); poolv=priorHi; vld=true; }
+      else if(bull){ dr=1; tipv=lo; bH=MathMax(op,cl); bL=MathMin(op,cl); poolv=priorLo; vld=true; }
+   }
+   if(vld){
+      double m=LX_NA;
+      if(dr==-1)      m=bH+(tipv-bH)*0.5;
+      else if(dr==1)  m=tipv+(bL-tipv)*0.5;
+      dir=dr; tip=tipv; mid=m; pool=poolv; valid=true;
+   }
+}
+
+// ---- A14: multi-TF FU pools -> fresh tap + magnet target ----
+void LX_FU()
+{
+   g_lxFuFresh=false; g_lxFuDir=0; g_lxFuTip=LX_NA; g_lxFuTarget=LX_NA;
+   if(!InpUseLetraCtx) return;
+   ENUM_TIMEFRAMES tfs[6]; tfs[0]=PERIOD_W1; tfs[1]=PERIOD_D1; tfs[2]=PERIOD_H4; tfs[3]=PERIOD_H1; tfs[4]=PERIOD_M15; tfs[5]=PERIOD_M5;
+   double cl=Close[1]; double atr=GetATR(1); if(atr<=0) atr=10.0;
+   for(int k=0;k<6;k++){
+      int dr; double tip,mid,pool; bool vld;
+      LX_FUlast(tfs[k],dr,tip,mid,pool,vld);
+      if(vld && LX_naf(g_lxFuTarget) && !LX_naf(pool)) g_lxFuTarget=pool;           // highest TF magnet
+      if(vld && !LX_naf(tip) && MathAbs(cl-tip)<=atr*0.5 && !g_lxFuFresh){ g_lxFuFresh=true; g_lxFuDir=dr; g_lxFuTip=tip; }
+   }
+}
+
+// ---- B: TIE cycle stack (MN/W/D/H4/H1 opens vs price) ----
+void LX_TIE()
+{
+   g_lxTimeDir=0; g_lxTimeAlign=50.0;
+   if(!InpUseLetraCtx) return;
+   double cl=Close[1];
+   ENUM_TIMEFRAMES tfs[5]; tfs[0]=PERIOD_MN1; tfs[1]=PERIOD_W1; tfs[2]=PERIOD_D1; tfs[3]=PERIOD_H4; tfs[4]=PERIOD_H1;
+   int bull=0,bear=0;
+   for(int k=0;k<5;k++){
+      MqlRates r[]; ArraySetAsSeries(r,false);
+      if(CopyRates(_Symbol,tfs[k],0,2,r)<1) continue;
+      double o=r[ArraySize(r)-1].open;
+      if(cl>o) bull++; else if(cl<o) bear++;
+   }
+   g_lxTimeDir=(bull>bear?1:(bear>bull?-1:0));
+   int tot=bull+bear; g_lxTimeAlign=(tot>0?(double)MathMax(bull,bear)/tot*100.0:50.0);
+}
+
+// ---- A8/A10/A11/B + EPE-lite: geometry, manip band, true induction,
+//      failure swing, fractal stack, curve life, expected recursion,
+//      Wyckoff shift counter, entry probability ----
+void LX_BuildContext2()
+{
+   if(!InpUseLetraCtx) return;
+   datetime ct=Time[1];
+   double   cl=Close[1];
+   double   atr=GetATR(1); if(atr<=0) atr=10.0;
+
+   double rdir[6],dm[6],cmp[6],rc[6],wp[6],iv[6],ft[6],fb[6],sh[6],sl[6]; int dr[6];
+   LXSE ses[6]; ses[0]=lse1; ses[1]=lse3; ses[2]=lse5; ses[3]=lse15; ses[4]=lse60; ses[5]=lse240;
+   for(int k=0;k<6;k++){
+      rdir[k]=LX_nz(LX_MapVal(ses[k].t,ses[k].dir,ses[k].n,ct));
+      iv[k]  =LX_MapVal(ses[k].t,ses[k].inv,ses[k].n,ct);
+      dm[k]  =LX_nz(LX_MapVal(ses[k].t,ses[k].dom,ses[k].n,ct));
+      cmp[k] =LX_nz(LX_MapVal(ses[k].t,ses[k].comp,ses[k].n,ct));
+      rc[k]  =LX_nz(LX_MapVal(ses[k].t,ses[k].rec,ses[k].n,ct));
+      wp[k]  =LX_nz(LX_MapVal(ses[k].t,ses[k].wp,ses[k].n,ct));
+      ft[k]  =LX_MapVal(ses[k].t,ses[k].ft,ses[k].n,ct);
+      fb[k]  =LX_MapVal(ses[k].t,ses[k].fb,ses[k].n,ct);
+      sh[k]  =LX_MapVal(ses[k].t,ses[k].sh,ses[k].n,ct);
+      sl[k]  =LX_MapVal(ses[k].t,ses[k].sl,ses[k].n,ct);
+      dr[k]  =LX_wdir(iv[k],cl,(int)rdir[k]);
+   }
+
+   // --- Fractal stack alignment ---
+   int sb=0,sbe=0; for(int k=0;k<6;k++){ if(dr[k]==1) sb++; else if(dr[k]==-1) sbe++; }
+   g_lxStackDir=(sb>sbe?1:(sbe>sb?-1:0));
+   g_lxStackPct=(double)MathMax(sb,sbe)/6.0*100.0;
+
+   int own=g_lxOwnerIdx;
+   double ownComp=(own>=0?cmp[own]:0.0);
+   double ownWp  =(own>=0?wp[own]:0.0);
+   double ownRec =(own>=0?rc[own]:0.0);
+   g_lxCompReg = ownComp>=80.0?"Extreme":ownComp>=55.0?"High":ownComp>=30.0?"Medium":"Low";
+
+   // --- Geometry: distance to HTF flip mid + flip width (owner) ---
+   g_lxFlipWidthAtr=0.0;
+   if(own>=0 && !LX_naf(ft[own]) && !LX_naf(fb[own])) g_lxFlipWidthAtr=MathAbs(ft[own]-fb[own])/atr;
+   g_lxDistFlipAtr=(!LX_naf(g_lxFlipMid))?MathAbs(cl-g_lxFlipMid)/atr:5.0;
+
+   // --- Compression -> expected remaining recursions ---
+   int recReq = ownComp>=80.0?5:ownComp>=55.0?4:ownComp>=30.0?3:1;
+   g_lxExpRec = (int)MathMax(0.0,(double)recReq-ownRec);
+
+   // --- Lowest flip = true S/D (deepest opposing flip on the macro bias) ---
+   g_lxLowestFlip=LX_NA;
+   for(int k=0;k<6;k++){
+      if(g_lxMacroDir>=0 && dr[k]==1 && !LX_naf(ft[k]) && ft[k]<cl && (LX_naf(g_lxLowestFlip)||ft[k]<g_lxLowestFlip)) g_lxLowestFlip=ft[k];
+      if(g_lxMacroDir<=0 && dr[k]==-1 && !LX_naf(fb[k]) && fb[k]>cl && (LX_naf(g_lxLowestFlip)||fb[k]>g_lxLowestFlip)) g_lxLowestFlip=fb[k];
+   }
+   g_lxAtTrueInduction=(!LX_naf(g_lxLowestFlip) && MathAbs(cl-g_lxLowestFlip)<=atr*0.75);
+
+   // --- Manipulation band (0.618-0.786 of owner leg) ---
+   g_lxInManipBand=false;
+   if(own>=0){
+      double ext=(g_lxOwnerDir==1?sh[own]:(g_lxOwnerDir==-1?sl[own]:LX_NA));
+      double org=iv[own];
+      if(!LX_naf(ext) && !LX_naf(org) && ext!=org){
+         double f618=ext+0.618*(org-ext), f786=ext+0.786*(org-ext);
+         double blo=MathMin(f618,f786), bhi=MathMax(f618,f786);
+         g_lxInManipBand=(cl>=blo && cl<=bhi && !g_lxAtTrueInduction);
+      }
+   }
+
+   // --- Failure swing (spring): sweep beyond true flip + reclaim in High/Extreme compression ---
+   bool comp=(g_lxCompReg=="High"||g_lxCompReg=="Extreme");
+   double clo=Low[1], chi=High[1];
+   bool fsL=(!LX_naf(g_lxLowestFlip)&&g_lxMacroDir>=0&&clo<g_lxLowestFlip&&cl>g_lxLowestFlip);
+   bool fsS=(!LX_naf(g_lxLowestFlip)&&g_lxMacroDir<=0&&chi>g_lxLowestFlip&&cl<g_lxLowestFlip);
+   g_lxFailureSwing=(comp && (fsL||fsS));
+
+   // --- Wyckoff terminal shift counter (persistent across bars) ---
+   bool atFlip=(g_lxDistFlipAtr<=1.0);
+   if(!atFlip){ g_lxTermActive=false; g_lxTermShifts=0; g_lxTermPrevDir=g_lxOwnerDir; }
+   else {
+      if(!g_lxTermActive){ g_lxTermActive=true; g_lxTermShifts=0; g_lxTermPrevDir=g_lxOwnerDir; }
+      if(g_lxOwnerDir!=0 && g_lxOwnerDir!=g_lxTermPrevDir){ g_lxTermShifts++; g_lxTermPrevDir=g_lxOwnerDir; }
+   }
+   g_lxTermExpected=recReq;
+   g_lxTermComplete=(atFlip && g_lxTermShifts>=g_lxTermExpected);
+
+   // --- Curve life ("is the trade alive?") — winner-management read, NOT an entry gate ---
+   double residual=MathMax(0.0,MathMin(100.0,100.0-ownWp));
+   bool   progressing=(g_lxOwnerDir!=0 && g_lxOwnerDir==g_lxMacroDir);
+   double cpForce=MathMax(0.0,MathMin(100.0,ownComp*0.50+residual*0.20-ownRec*12.0+8.0));
+   g_lxLife=MathMax(0.0,MathMin(100.0,cpForce*0.45+residual*0.30+(progressing?28.0:0.0)+10.0));
+
+   // --- EPE-lite entry probability ---
+   double distTerm=MathMax(0.0,MathMin(100.0,100.0-g_lxDistFlipAtr*12.5));
+   g_lxEntryProb=MathMax(0.0,MathMin(100.0,
+      g_lxOwnerDom*0.40 + distTerm*0.40 + (g_lxTermComplete?20.0:(double)g_lxTermShifts*4.0)));
+}
+
+
+//==================================================================
 // 15. TRADING EXECUTION
 // Pre-entry basket ceiling applied before every OrderSend.
 // No trimming needed: if the ceiling is reached, entry is skipped.
@@ -1352,6 +1560,26 @@ void ExecuteTrading()
          int _h=_dt.hour+InpTargetGMT; if(_h<0) _h+=24; if(_h>=24) _h-=24; int _m=_dt.min;
          bool _news=((_h==InpCtxNewsH1 && _m>=InpCtxNewsM1)||(_h==InpCtxNewsH2 && _m<=InpCtxNewsM2));
          if(_news){ L3=false; L4=false; S3=false; S4=false; }
+      }
+
+      // ===== PHASE-2 OPTIONAL GATES (all default OFF) =====
+      // 5) Fractal stack must agree with the trade.
+      if(InpCtxFractalAgree){
+         if(g_lxStackDir==-1){ L3=false; L4=false; }
+         if(g_lxStackDir==1) { S3=false; S4=false; }
+      }
+      // 6) Skip the 0.618-0.786 manipulation band (unless at true induction).
+      if(InpCtxAvoidManip && g_lxInManipBand && !g_lxAtTrueInduction){ L3=false; L4=false; S3=false; S4=false; }
+      // 7) Wyckoff terminal: near the flip, require N shifts (failure-swing bypasses).
+      if(InpCtxMinShifts>0 && g_lxDistFlipAtr<=1.0 && g_lxTermShifts<InpCtxMinShifts && !g_lxFailureSwing){
+         L3=false; L4=false; S3=false; S4=false;
+      }
+      // 8) Minimum entry probability (EPE-lite).
+      if(InpCtxMinEntryProb>0.0 && g_lxEntryProb<InpCtxMinEntryProb){ L3=false; L4=false; S3=false; S4=false; }
+      // 9) Require M5 momentum into the trade direction.
+      if(InpCtxMomFlip){
+         if(!(g_lxImpBull || g_lxVel>0.0)){ L3=false; L4=false; }
+         if(!(g_lxImpBear || g_lxVel<0.0)){ S3=false; S4=false; }
       }
    }
 
@@ -1599,6 +1827,11 @@ void OnTick()
 
    // 2B. Letra multi-TF context (default off) — 6-TF ownership / flip / dominance / death / ODDE
    LX_BuildContext();
+   // 2C. Letra Phase-2 engines — physics / FU pools / TIE / geometry / manip / Wyckoff / life / EPE
+   LX_Physics();
+   LX_FU();
+   LX_TIE();
+   LX_BuildContext2();
 
    // 3. Profit ladder and trailing stop protection
    RunStopProtection();

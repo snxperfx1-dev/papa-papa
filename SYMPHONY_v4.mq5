@@ -128,6 +128,14 @@ input bool   InpTradeAllTF        = true;   // Fire P3/P4 from every timeframe c
 input int    InpEntryFromTFIndex  = 0;      // Lowest entry timeframe (0=M1 1=M5 2=M15 3=H1 4=H4 5=D1)
 // --- CLASSIC v1.6 entry path: fire on the per-direction chart phase P3/P4 (like the original) ---
 input bool   InpUseClassicEntry   = true;   // ENTRIES like original v1.6: gL/gS phase==3 (P3) or ==4+breakout (P4). Bypasses cascade/zone/confluence gates.
+// --- DEEP CONTEXT INTEGRATION: the v1.6 P3/P4 TRIGGER is preserved; the fractal model
+//     scores / sizes / targets / tags it, and hard-vetoes ONLY on full structural opposition ---
+input bool   InpCtxIntegrate      = true;   // CONTEXT: score, size and target each preserved v1.6 entry with the fractal model
+input bool   InpCtxVetoOpposition = true;   // hard-skip an entry ONLY when MTF bias + cascade + curve owner ALL oppose it (new-high-then-rotated rule)
+input double InpCtxMinConfidence  = 0.0;    // also skip entries below this context confidence (0 = never skip on score alone)
+input double InpCtxSizeMinMult    = 0.5;    // risk multiplier at 0 context confidence (weak-context entries trade smaller)
+input double InpCtxSizeMaxMult    = 1.4;    // risk multiplier at 100 context confidence (premium-context entries trade larger)
+input bool   InpCtxZoneStop       = true;   // when price is AT a higher-TF zone, use the structural zone stop instead of the anchor stop
 
 //==================================================================
 // 1D. INPUTS - ARC v2
@@ -2267,6 +2275,101 @@ void LogEntry(int dir, int tf, double entry, double sl, double lots, double zone
          "  range [dem ",DoubleToString(g_flipDemand,2)," / sup ",DoubleToString(g_flipSupply,2),"]");
 }
 
+// ===== DEEP CONTEXT EVALUATOR =====
+// The v1.6 P3/P4 phase is the TRIGGER. This folds the whole fractal model around it:
+// it SCORES the entry (confidence), classifies it, picks the zone-structural stop and
+// the owner-driven parent destination, scales risk by context, and hard-vetoes ONLY
+// when MTF bias + cascade + curve owner ALL oppose (price made a new extreme and the
+// whole structure rotated against the entry). Otherwise every v1.6 entry is preserved.
+struct EntryCtx
+{
+   bool   veto;
+   double confidence;   // 0..100
+   double sizeMult;     // risk multiplier
+   bool   atZone;
+   int    zoneTF;
+   double zonePrice;
+   int    destTF;
+   double destPrice;
+   double destRoomATR;
+   string tag;          // short classification for the order comment
+   string note;         // full context line for the journal
+};
+
+void EvalEntryContext(int dir, double px, double atr, EntryCtx &e)
+{
+   e.veto = false; e.confidence = 50.0; e.sizeMult = 1.0;
+   e.atZone = false; e.zoneTF = -1; e.zonePrice = 0.0;
+   e.destTF = -1; e.destPrice = 0.0; e.destRoomATR = 1e9;
+   e.tag = "RAW"; e.note = "context off";
+   if(!InpCtxIntegrate) return;   // pure v1.6 behaviour
+
+   double conf = 30.0;   // base for a valid P3/P4 trigger
+
+   // 1. MTF directional bias - higher TFs weigh more
+   int  mb         = MTFBias();
+   bool mtfAligned = (mb == dir);
+   bool mtfOpposed = (mb == -dir);
+   if(mtfAligned)      conf += 22.0;
+   else if(mb == 0)    conf += 8.0;
+   else                conf -= 6.0;
+
+   // 2. rotation cascade - lower TFs lead, deeper aligned cascade = stronger
+   bool casAligned = (g_cascadeDir == dir);
+   bool casOpposed = (g_cascadeDir == -dir);
+   if(casAligned) conf += MathMin(20.0, 6.0 + g_cascadeDepth * 3.0);
+
+   // 3. curve-tree owner
+   int  ownDir     = (dir == 1) ? gLong.m_ownDir : gShort.m_ownDir;
+   bool ownAligned = (ownDir == dir);
+   bool ownOpposed = (ownDir == -dir);
+   if(ownAligned)      conf += 14.0;
+   else if(ownOpposed) conf -= 14.0;
+
+   // 4. at a higher-TF zone -> PREMIUM, structural stop + bigger context
+   int ztf = -1; double zp = 0.0;
+   if(AtHigherTFZone(dir, px, atr, ztf, zp))
+   { e.atZone = true; e.zoneTF = ztf; e.zonePrice = zp; conf += 18.0; }
+
+   // 5. cross-timeframe phase confluence
+   int pc = PhaseConfluence(dir);
+   conf += MathMin(16.0, pc * 3.0);
+
+   // 6. hunt-cycle alignment
+   if(InpUseHuntCycle && g_huntMode == dir)  conf += 8.0;
+   if(InpUseHuntCycle && g_huntMode == -dir) conf -= 6.0;
+
+   conf = Clamp(conf, 0.0, 100.0);
+   e.confidence = conf;
+
+   // owner-driven parent destination (the target this entry is travelling to)
+   double room = 1e9; int dtf = -1;
+   e.destPrice   = (dir == 1) ? DestinationSupply(px, atr, dtf, room)
+                              : DestinationDemand(px, atr, dtf, room);
+   e.destTF      = dtf;
+   e.destRoomATR = room;
+
+   // HARD VETO — only when the WHOLE structure opposes (this is the "new extreme then
+   // full rotation against us" case the user flagged), or below an explicit conf floor.
+   if(InpCtxVetoOpposition && mtfOpposed && casOpposed && ownOpposed) e.veto = true;
+   if(conf < InpCtxMinConfidence) e.veto = true;
+
+   // risk multiplier from confidence
+   e.sizeMult = InpCtxSizeMinMult + (InpCtxSizeMaxMult - InpCtxSizeMinMult) * (conf / 100.0);
+
+   // classification + journal note
+   string cls = e.atZone ? ("PRIM@" + g_mtfLbl[ztf])
+              : (casAligned || mtfAligned) ? "CONT" : "SOLO";
+   e.tag  = cls;
+   e.note = cls + " cf" + DoubleToString(conf, 0) + " x" + DoubleToString(e.sizeMult, 2)
+          + " | MTF " + (mb==1?"^":mb==-1?"v":"-")
+          + " cas " + (g_cascadeDir==1?"^":g_cascadeDir==-1?"v":"-") + IntegerToString(g_cascadeDepth)
+          + " own " + (ownDir==1?"^":ownDir==-1?"v":"-")
+          + " conf " + IntegerToString(pc) + "TF"
+          + " dest " + (dtf>=0?g_mtfLbl[dtf]:"-") + " " + DoubleToString(room,1) + "ATR"
+          + (e.veto?" [VETO opposition]":"");
+}
+
 void ExecuteTrading()
 {
    if((int)ArraySize(Close) < 3) return;
@@ -2297,17 +2400,26 @@ void ExecuteTrading()
          bool breakout = (close > gL_anchorHigh || close > High[2] + 0.20 * atr);
          if(L3 || (L4 && breakout))
          {
-            double entry = close;
-            double sl    = gL_anchorLow - atr * 0.25;
-            double minD  = InpMinSLATR * atr;
-            if(entry - sl < minD) sl = entry - minD;     // floor the stop distance
-            if(sl > 0.0 && entry > sl)
+            EntryCtx e; EvalEntryContext(1, close, atr, e);
+            if(!e.veto)
             {
-               double lots = ComputeLots(riskCash, entry, sl);
-               lots = AdjustLotsForBasketCeiling(1, entry, sl, lots);
-               string cmt = L4 ? "SYM P4 Long" : "SYM P3 Long";
-               if(lots > 0.0 && SendMarketOrder(+1, lots, sl, cmt))
-               { gL_lastTradeTime = barTime; LogEntry(1, 2, entry, sl, lots, gL_anchorLow); }
+               double entry = close;
+               double sl    = gL_anchorLow - atr * 0.25;
+               if(InpCtxZoneStop && e.atZone) sl = e.zonePrice - InpZoneSLBufferATR * atr; // structural zone stop
+               double minD  = InpMinSLATR * atr;
+               if(entry - sl < minD) sl = entry - minD;     // floor the stop distance
+               if(sl > 0.0 && entry > sl)
+               {
+                  double lots = ComputeLots(riskCash, entry, sl) * e.sizeMult;   // context-scaled risk
+                  lots = AdjustLotsForBasketCeiling(1, entry, sl, lots);
+                  string cmt = (L4 ? "SYM P4L " : "SYM P3L ") + e.tag;
+                  if(lots > 0.0 && SendMarketOrder(+1, lots, sl, cmt))
+                  {
+                     gL_lastTradeTime = barTime;
+                     if(InpDebugLog) Print("   CTX  L  : ", e.note);
+                     LogEntry(1, (e.zoneTF >= 0 ? e.zoneTF : 2), entry, sl, lots, (e.atZone ? e.zonePrice : gL_anchorLow));
+                  }
+               }
             }
          }
       }
@@ -2320,17 +2432,26 @@ void ExecuteTrading()
          bool breakout = (close < gS_anchorLow || close < Low[2] - 0.20 * atr);
          if(S3 || (S4 && breakout))
          {
-            double entry = close;
-            double sl    = gS_anchorHigh + atr * 0.25;
-            double minD  = InpMinSLATR * atr;
-            if(sl - entry < minD) sl = entry + minD;     // floor the stop distance
-            if(sl > 0.0 && sl > entry)
+            EntryCtx e; EvalEntryContext(-1, close, atr, e);
+            if(!e.veto)
             {
-               double lots = ComputeLots(riskCash, entry, sl);
-               lots = AdjustLotsForBasketCeiling(-1, entry, sl, lots);
-               string cmt = S4 ? "SYM P4 Short" : "SYM P3 Short";
-               if(lots > 0.0 && SendMarketOrder(-1, lots, sl, cmt))
-               { gS_lastTradeTime = barTime; LogEntry(-1, 2, entry, sl, lots, gS_anchorHigh); }
+               double entry = close;
+               double sl    = gS_anchorHigh + atr * 0.25;
+               if(InpCtxZoneStop && e.atZone) sl = e.zonePrice + InpZoneSLBufferATR * atr; // structural zone stop
+               double minD  = InpMinSLATR * atr;
+               if(sl - entry < minD) sl = entry + minD;     // floor the stop distance
+               if(sl > 0.0 && sl > entry)
+               {
+                  double lots = ComputeLots(riskCash, entry, sl) * e.sizeMult;   // context-scaled risk
+                  lots = AdjustLotsForBasketCeiling(-1, entry, sl, lots);
+                  string cmt = (S4 ? "SYM P4S " : "SYM P3S ") + e.tag;
+                  if(lots > 0.0 && SendMarketOrder(-1, lots, sl, cmt))
+                  {
+                     gS_lastTradeTime = barTime;
+                     if(InpDebugLog) Print("   CTX  S  : ", e.note);
+                     LogEntry(-1, (e.zoneTF >= 0 ? e.zoneTF : 2), entry, sl, lots, (e.atZone ? e.zonePrice : gS_anchorHigh));
+                  }
+               }
             }
          }
       }

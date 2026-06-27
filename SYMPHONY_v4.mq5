@@ -160,6 +160,7 @@ input double InpArcToleranceAtr   = 0.20;   // Close-to-ARC exhaustion tolerance
 //==================================================================
 input double InpRiskPercent       = 0.5;    // Risk % per entry (of equity)
 input double InpMaxBasketRiskPct  = 3.0;    // Max per-direction basket risk % of equity
+input bool   InpUseBasketCeiling  = false;  // RISK CEILING off by default = pure v1.6 sizing (per-trade risk%, free stacking). On = cap per-direction basket risk.
 input int    InpMagic             = 240220; // EA magic number
 input double InpLadderRung1       = 0.7;    // Rung 1 trigger (PnL >= 0.7x basket risk)
 input double InpLadderRung2       = 1.5;    // Rung 2 trigger
@@ -1636,6 +1637,7 @@ double GetBasketDollarRisk(int direction)
 double AdjustLotsForBasketCeiling(int direction, double entry, double sl, double computedLots)
 {
    if(computedLots <= 0.0) return 0.0;
+   if(!InpUseBasketCeiling) return computedLots;   // v1.6 mode: no basket ceiling, never silently blocks an entry
    double equity        = AccountInfoDouble(ACCOUNT_EQUITY);
    double maxBasketRisk = equity * InpMaxBasketRiskPct / 100.0;
    double currentRisk   = GetBasketDollarRisk(direction);

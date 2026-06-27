@@ -126,6 +126,8 @@ input bool   InpRequirePhaseConfluence = true; // entries must be nested under a
 input int    InpMinPhaseConfluence = 2;     // min # of timeframes in the entry direction's phase/structure
 input bool   InpTradeAllTF        = true;   // Fire P3/P4 from every timeframe curve (not just chart)
 input int    InpEntryFromTFIndex  = 0;      // Lowest entry timeframe (0=M1 1=M5 2=M15 3=H1 4=H4 5=D1)
+// --- CLASSIC v1.6 entry path: fire on the per-direction chart phase P3/P4 (like the original) ---
+input bool   InpUseClassicEntry   = true;   // ENTRIES like original v1.6: gL/gS phase==3 (P3) or ==4+breakout (P4). Bypasses cascade/zone/confluence gates.
 
 //==================================================================
 // 1D. INPUTS - ARC v2
@@ -2273,6 +2275,67 @@ void ExecuteTrading()
    double riskCash = equity * InpRiskPercent * 0.01;
    double close    = Close[1];
    double atr      = GetATR(1); if(atr <= 0.0) atr = 1e-6;
+
+   // ==============================================================
+   // CLASSIC v1.6 ENTRY PATH — fire on the per-direction chart phase
+   // exactly like the original EA: P3 (retrace-resume) or P4 (breakout).
+   // Bypasses the cascade / zone / confluence stack so the EA actually
+   // takes the trend entries the way v1.6 did. All the new structure
+   // (cascade/hunt/zones/maturity/curve) still runs for MANAGEMENT/EXITS.
+   // ==============================================================
+   if(InpUseClassicEntry)
+   {
+      datetime barTime = Time[0];
+      bool blockL = InpBlockCounterProfit && (GetDirectionFloatingPnL(-1) > 0.0);
+      bool blockS = InpBlockCounterProfit && (GetDirectionFloatingPnL(1)  > 0.0);
+
+      // ---- LONG P3 / P4 ----
+      bool L3 = (gL_active && gL_phase == 3);
+      bool L4 = (gL_active && gL_phase == 4);
+      if(!blockL && (L3 || L4) && gL_lastTradeTime != barTime)
+      {
+         bool breakout = (close > gL_anchorHigh || close > High[2] + 0.20 * atr);
+         if(L3 || (L4 && breakout))
+         {
+            double entry = close;
+            double sl    = gL_anchorLow - atr * 0.25;
+            double minD  = InpMinSLATR * atr;
+            if(entry - sl < minD) sl = entry - minD;     // floor the stop distance
+            if(sl > 0.0 && entry > sl)
+            {
+               double lots = ComputeLots(riskCash, entry, sl);
+               lots = AdjustLotsForBasketCeiling(1, entry, sl, lots);
+               string cmt = L4 ? "SYM P4 Long" : "SYM P3 Long";
+               if(lots > 0.0 && SendMarketOrder(+1, lots, sl, cmt))
+               { gL_lastTradeTime = barTime; LogEntry(1, 2, entry, sl, lots, gL_anchorLow); }
+            }
+         }
+      }
+
+      // ---- SHORT P3 / P4 ----
+      bool S3 = (gS_active && gS_phase == 3);
+      bool S4 = (gS_active && gS_phase == 4);
+      if(!blockS && (S3 || S4) && gS_lastTradeTime != barTime)
+      {
+         bool breakout = (close < gS_anchorLow || close < Low[2] - 0.20 * atr);
+         if(S3 || (S4 && breakout))
+         {
+            double entry = close;
+            double sl    = gS_anchorHigh + atr * 0.25;
+            double minD  = InpMinSLATR * atr;
+            if(sl - entry < minD) sl = entry + minD;     // floor the stop distance
+            if(sl > 0.0 && sl > entry)
+            {
+               double lots = ComputeLots(riskCash, entry, sl);
+               lots = AdjustLotsForBasketCeiling(-1, entry, sl, lots);
+               string cmt = S4 ? "SYM P4 Short" : "SYM P3 Short";
+               if(lots > 0.0 && SendMarketOrder(-1, lots, sl, cmt))
+               { gS_lastTradeTime = barTime; LogEntry(-1, 2, entry, sl, lots, gS_anchorHigh); }
+            }
+         }
+      }
+      return;   // classic path handled entries; skip the new-model gate stack
+   }
 
    // ONLY trade a CONFIRMED rotation, and ONLY in the rotation's direction.
    // (cascade bullish -> buys only; cascade bearish -> sells only.) This is why it

@@ -1023,6 +1023,45 @@ string MTF_StoryLine()
    return s;
 }
 
+// ===== Owner-Driven Destination Engine (ODDE) =====
+// owner = the HIGHEST timeframe currently holding the given direction (hierarchical
+// ownership). The destination inherits from the owner curve and auto-escalates: once
+// price breaks the owner's zone, the next higher timeframe's zone becomes the target.
+int OwnerTF(int dir)
+{
+   int idx = -1;
+   for(int i = 0; i < 6; i++) if(g_mtfDir[i] == dir) idx = i;   // highest index matching dir
+   return idx;
+}
+// LONG destination: nearest SUPPLY above price at/above the bull owner (escalates up).
+double DestinationSupply(double px, double atr, int &tfOut, double &roomATR)
+{
+   tfOut = -1; roomATR = 1e9; double best = 0.0;
+   int owner = OwnerTF(1);
+   int lo = (owner >= 0) ? owner : ((InpParentFromTFIndex < 0) ? 0 : InpParentFromTFIndex);
+   for(int i = lo; i < 6; i++)
+   {
+      double v = g_mtfSupply[i];
+      if(v > px && (best == 0.0 || v < best)) { best = v; tfOut = i; }
+   }
+   if(best > 0.0) roomATR = (best - px) / MathMax(atr, 1e-9);
+   return best;
+}
+// SHORT destination: nearest DEMAND below price at/above the bear owner (escalates up).
+double DestinationDemand(double px, double atr, int &tfOut, double &roomATR)
+{
+   tfOut = -1; roomATR = 1e9; double best = 0.0;
+   int owner = OwnerTF(-1);
+   int lo = (owner >= 0) ? owner : ((InpParentFromTFIndex < 0) ? 0 : InpParentFromTFIndex);
+   for(int i = lo; i < 6; i++)
+   {
+      double v = g_mtfDemand[i];
+      if(v > 0.0 && v < px && v > best) { best = v; tfOut = i; }
+   }
+   if(best > 0.0) roomATR = (px - best) / MathMax(atr, 1e-9);
+   return best;
+}
+
 // Net MTF DIRECTION authority: higher timeframes weigh more (owner = higher TF).
 // Returns +1 bullish bias, -1 bearish bias, 0 balanced. This is the direction the
 // algo is ALLOWED to trade — entries against it are blocked.
@@ -1688,8 +1727,9 @@ void ManageExits()
    bool   expandedLong  = (travelL >= InpExpandMinATR * atrG);
    bool   expandedShort = (travelS >= InpExpandMinATR * atrG);
    double roomL = 1e9, roomS = 1e9;
-   double parSupL = ParentSupplyAbove(closeNow, atrG, roomL);
-   double parDemS = ParentDemandBelow(closeNow, atrG, roomS);
+   int    destTFL = -1, destTFS = -1;
+   double parSupL = DestinationSupply(closeNow, atrG, destTFL, roomL);   // owner-driven (escalates)
+   double parDemS = DestinationDemand(closeNow, atrG, destTFS, roomS);
    bool   nearParentL = (parSupL > 0.0 && roomL <= InpParentApproachATR);
    bool   nearParentS = (parDemS > 0.0 && roomS <= InpParentApproachATR);
    bool   destLong  = (!InpUseParentExit) || (expandedLong  && nearParentL);
@@ -1700,11 +1740,11 @@ void ManageExits()
    bool lifeWeakL = InpUseParentExit ? (gLong.LifeDeadCross()  || gLong.m_life  < InpLifeDeadExit) : gLong.LifeDeadCross();
    bool lifeWeakS = InpUseParentExit ? (gShort.LifeDeadCross() || gShort.m_life < InpLifeDeadExit) : gShort.LifeDeadCross();
 
-   // ---------- LIFE-SCORE EXIT (armed + grace + expanded + at parent S/D) ----------
+   // ---------- LIFE-SCORE EXIT (armed + grace + expanded + at OWNER destination) ----------
    if(InpUseLifeExit && longPos > 0 && g_longLifeArmed && longGraceOK && destLong && lifeWeakL)
-   { exitLong = true; reasonL = (InpUseParentExit ? "LIFE@PARENT" : "LIFE DEAD"); }
+   { exitLong = true; reasonL = (InpUseParentExit ? ("LIFE@"+(destTFL>=0?g_mtfLbl[destTFL]:"DEST")) : "LIFE DEAD"); }
    if(InpUseLifeExit && shortPos > 0 && g_shortLifeArmed && shortGraceOK && destShort && lifeWeakS)
-   { exitShort = true; reasonS = (InpUseParentExit ? "LIFE@PARENT" : "LIFE DEAD"); }
+   { exitShort = true; reasonS = (InpUseParentExit ? ("LIFE@"+(destTFS>=0?g_mtfLbl[destTFS]:"DEST")) : "LIFE DEAD"); }
 
    // whole-chain collapse (optional, same gating)
    if(InpUseChainDecayExit && !exitLong  && longPos  > 0 && g_longLifeArmed  && longGraceOK && destLong
@@ -1996,13 +2036,17 @@ void UpdateDashboard()
    s += "GATE: Lcurve " + (CurveAllowsLong()? "OPEN":"shut")
       + "  Scurve " + (CurveAllowsShort()? "OPEN":"shut") + nl;
    double dRoomL = 1e9, dRoomS = 1e9, dAtr = GetATR(1);
-   double dSupL = ParentSupplyAbove(Close[1], dAtr, dRoomL);
-   double dDemS = ParentDemandBelow(Close[1], dAtr, dRoomS);
+   int    dTFL = -1, dTFS = -1;
+   double dSupL = DestinationSupply(Close[1], dAtr, dTFL, dRoomL);
+   double dDemS = DestinationDemand(Close[1], dAtr, dTFS, dRoomS);
+   int    ownL = OwnerTF(1), ownS = OwnerTF(-1);
    double dTravL = (gLong.m_ownExtreme  > 0.0 && gLong.m_ownOrigin  > 0.0) ? (gLong.m_ownExtreme - gLong.m_ownOrigin)  / MathMax(dAtr,1e-9) : 0.0;
    double dTravS = (gShort.m_ownExtreme > 0.0 && gShort.m_ownOrigin > 0.0) ? (gShort.m_ownOrigin - gShort.m_ownExtreme) / MathMax(dAtr,1e-9) : 0.0;
-   s += "PARENT: L supply " + (dSupL>0.0? DoubleToString(dSupL,2)+" ("+DoubleToString(dRoomL,1)+" ATR)" : "-")
-      + " exp " + DoubleToString(dTravL,1)
-      + " | S demand " + (dDemS>0.0? DoubleToString(dDemS,2)+" ("+DoubleToString(dRoomS,1)+" ATR)" : "-")
+   s += "DEST(owner): L own " + (ownL>=0?g_mtfLbl[ownL]:"-")
+      + " -> " + (dTFL>=0?g_mtfLbl[dTFL]:"-") + " " + (dSupL>0.0? DoubleToString(dSupL,2)+" ("+DoubleToString(dRoomL,1)+" ATR)":"-")
+      + " exp " + DoubleToString(dTravL,1) + nl;
+   s += "DEST(owner): S own " + (ownS>=0?g_mtfLbl[ownS]:"-")
+      + " -> " + (dTFS>=0?g_mtfLbl[dTFS]:"-") + " " + (dDemS>0.0? DoubleToString(dDemS,2)+" ("+DoubleToString(dRoomS,1)+" ATR)":"-")
       + " exp " + DoubleToString(dTravS,1) + nl;
    // per-TF supply/demand distance in ATR (up = +, down = -) so the interaction is visible
    double pz = Close[1];

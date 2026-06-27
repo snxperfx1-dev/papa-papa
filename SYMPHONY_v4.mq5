@@ -1027,6 +1027,36 @@ void UpdateMTFMap()
          g_mtfSupply[i] = MathMax(g_mtfOrigin[i], g_mtfExtreme[i]);
          g_mtfDemand[i] = MathMin(g_mtfOrigin[i], g_mtfExtreme[i]);
       }
+
+      // --- STRUCTURE-DERIVED PHASE: same leg drives dir, zones AND phase, so a rung's
+      //     P3/P4 can never contradict its own structure. retrace of price between the
+      //     leg's extreme and origin, in the structural direction. ---
+      int pL = 0, pS = 0;
+      double cl  = iClose(_Symbol, g_mtfTF[i], 1);
+      double clp = iClose(_Symbol, g_mtfTF[i], 2);
+      double dmom = cl - clp;
+      if(g_mtfDir[i] == 1 && g_mtfExtreme[i] > 0.0 && g_mtfOrigin[i] > 0.0)
+      {
+         double E = g_mtfExtreme[i], O = g_mtfOrigin[i];   // bull: E=swing high, O=swing low
+         double imp = E - O;
+         double retr = (imp > 0.0) ? (E - cl) / imp : 0.0;
+         if(retr > InpRetrMax || retr < 0.0)  pL = 0;
+         else if(cl >= E)                     pL = 4;       // new high / breakout
+         else if(retr >= InpRetrMin)          pL = (dmom < 0.0 ? 2 : 3);
+         else                                 pL = 1;       // expansion near the high
+      }
+      else if(g_mtfDir[i] == -1 && g_mtfExtreme[i] > 0.0 && g_mtfOrigin[i] > 0.0)
+      {
+         double E = g_mtfExtreme[i], O = g_mtfOrigin[i];   // bear: E=swing low, O=swing high
+         double imp = O - E;
+         double retr = (imp > 0.0) ? (cl - E) / imp : 0.0;
+         if(retr > InpRetrMax || retr < 0.0)  pS = 0;
+         else if(cl <= E)                     pS = 4;       // new low / breakdown
+         else if(retr >= InpRetrMin)          pS = (dmom > 0.0 ? 2 : 3);
+         else                                 pS = 1;       // expansion near the low
+      }
+      g_mtfPhaseL[i] = pL;
+      g_mtfPhaseS[i] = pS;
    }
 }
 
@@ -1211,48 +1241,35 @@ int PhaseConfluence(int dir)
 {
    int n = 0;
    for(int i = 0; i < 9; i++)
-   {
-      bool active = (dir == 1) ? gTFEng[i].Lactive : gTFEng[i].Sactive;
-      int  ph     = (dir == 1) ? gTFEng[i].Lphase  : gTFEng[i].Sphase;
-      if((active && ph >= 1) || g_mtfDir[i] == dir) n++;
-   }
+      if(g_mtfDir[i] == dir) n++;                       // structurally aligned timeframes
    return n;
 }
-// Is the entry nested under a HIGHER timeframe that supports the direction
-// (active & still building/retracing — phase 1..3 — or structurally aligned)?
+// Is the entry nested under a HIGHER timeframe whose structure supports the direction?
 bool HigherTFSupports(int idx, int dir)
 {
    for(int j = idx + 1; j < 9; j++)
-   {
-      bool active = (dir == 1) ? gTFEng[j].Lactive : gTFEng[j].Sactive;
-      int  ph     = (dir == 1) ? gTFEng[j].Lphase  : gTFEng[j].Sphase;
-      if((active && ph >= 1 && ph <= 3) || g_mtfDir[j] == dir) return true;
-   }
+      if(g_mtfDir[j] == dir) return true;
    return false;
 }
 
-// PHASE TRIGGER (the TIMING): a timeframe whose phase has transitioned into P3/P4 in
-// 'dir' — P3 = retracement complete (resumption), P4 = breakout/new extreme. This is
-// the firing event; the zone is WHERE and the cascade is the DIRECTION.
+// PHASE TRIGGER (the TIMING): a timeframe in P3/P4 in 'dir', derived from the SAME
+// structural leg as its direction — P3 = retracement complete (resume), P4 = breakout.
 bool PhaseTrigger(int dir)
 {
    for(int i = 0; i < 9; i++)
    {
-      bool active = (dir == 1) ? gTFEng[i].Lactive : gTFEng[i].Sactive;
-      int  ph     = (dir == 1) ? gTFEng[i].Lphase  : gTFEng[i].Sphase;
-      if(active && (ph == 3 || ph == 4)) return true;
+      int ph = (dir == 1) ? g_mtfPhaseL[i] : g_mtfPhaseS[i];
+      if(g_mtfDir[i] == dir && (ph == 3 || ph == 4)) return true;
    }
    return false;
 }
-// Did a P3/P4 transition happen THIS bar in 'dir' (phase just entered the 3/4 family)?
+// Any timeframe currently in a P3/P4 firing window in 'dir'.
 bool PhaseJustTransitioned(int dir)
 {
    for(int i = 0; i < 9; i++)
    {
-      bool active = (dir == 1) ? gTFEng[i].Lactive : gTFEng[i].Sactive;
-      int  ph     = (dir == 1) ? gTFEng[i].Lphase     : gTFEng[i].Sphase;
-      int  pph    = (dir == 1) ? gTFEng[i].LprevPhase : gTFEng[i].SprevPhase;
-      if(active && ph >= 3 && pph < 3) return true;
+      int ph = (dir == 1) ? g_mtfPhaseL[i] : g_mtfPhaseS[i];
+      if(g_mtfDir[i] == dir && ph >= 3) return true;
    }
    return false;
 }
@@ -2360,10 +2377,10 @@ void OnTick()
    UpdateStructure();
 
    // 3. multi-timeframe curve map (structural direction) + per-TF P3/P4 engines
+   // 3. multi-timeframe curve map (structure: dir + zones + phase, one coherent read) + cascade
    UpdateMTFMap();
    ComputeCascade();
    UpdateZoneContext();
-   UpdateMTFEngines();
 
    // 4. recursive curve trees + life + lineage + chain (per campaign)
    UpdateCampaigns();

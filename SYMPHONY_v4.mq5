@@ -97,8 +97,7 @@ input bool   InpBlockCounterProfit= true;   // Don't open one side while the OTH
 input bool   InpUseMTFDirection   = true;   // DIRECTION: only trade with the MTF map's net bias
 input bool   InpMTFRequireRungAgree = true; // also require the entry TF's own structure to agree (not opposed)
 input double InpMTFBiasDeadband   = 3.0;    // |weighted bias| <= this = balanced (one top TF can't veto aligned lower TFs)
-input int    InpRotTFa            = 1;      // rotation TF A index (default 1=M5)
-input int    InpRotTFb            = 2;      // rotation TF B index (default 2=M15)
+input int    InpRotCount          = 2;      // ROTATION = lowest N timeframes agree (2 = M1+M5 lead the rotation)
 // --- direction memory + cross-timeframe phase confluence ---
 input int    InpMTFConfirmBars    = 3;      // a TF's direction must confirm this many bars before it flips (anti-whipsaw)
 input bool   InpRequirePhaseConfluence = true; // entries must be nested under agreeing phases across timeframes
@@ -1099,13 +1098,15 @@ int MTFBias()
    if(MathAbs(sum) <= InpMTFBiasDeadband) return 0;   // balanced: one top TF can't veto aligned lower TFs
    return (sum > 0.0) ? 1 : -1;
 }
-// Lower-timeframe ROTATION: both execution timeframes agree on a direction.
-// When the lower TFs rotate, they LEAD — don't trade against them.
+// Lower-timeframe ROTATION: the lowest N timeframes (M1, M5, ...) all agree on a
+// direction. Lower timeframes LEAD — they rotate the higher timeframes — so when the
+// bottom of the stack turns, that direction is permitted and the opposite is blocked,
+// even against a higher-TF bias. This is the leading edge of a new move.
 bool LowerTFRotation(int dir)
 {
-   int a = InpRotTFa, b = InpRotTFb;
-   if(a < 0 || a > 5 || b < 0 || b > 5) return false;
-   return (g_mtfDir[a] == dir && g_mtfDir[b] == dir);
+   int n = InpRotCount; if(n < 1) n = 1; if(n > 6) n = 6;
+   for(int i = 0; i < n; i++) if(g_mtfDir[i] != dir) return false;
+   return true;
 }
 
 // ===== CROSS-TIMEFRAME PHASE COMMUNICATION =====

@@ -136,6 +136,15 @@ input double InpCtxMinConfidence  = 0.0;    // also skip entries below this cont
 input double InpCtxSizeMinMult    = 0.5;    // risk multiplier at 0 context confidence (weak-context entries trade smaller)
 input double InpCtxSizeMaxMult    = 1.4;    // risk multiplier at 100 context confidence (premium-context entries trade larger)
 input bool   InpCtxZoneStop       = true;   // when price is AT a higher-TF zone, use the structural zone stop instead of the anchor stop
+// --- LAYERED MESH: slow envelope (Layer 0) + class policy (Layer 2/3) + shadow validation ---
+input bool   InpEnvelopeSlow      = true;   // LAYER 0: slow, event-driven direction envelope (anti-flicker permission)
+input int    InpEnvConfirmBars    = 3;      // an envelope OPEN/CLOSE transition must persist this many bars (stickiness)
+input bool   InpCtxShadowMode     = false;  // VALIDATE FIRST: classify + log every entry but DON'T change behaviour (pure v1.6 trades)
+input bool   InpClassCTrade       = true;   // take C-grade (weak/counter) entries as micro-scalps (false = skip them entirely)
+input double InpClassASize        = 1.3;    // A / PRIMARY (at HTF zone, aligned, owner agrees) risk multiplier
+input double InpClassBSize        = 1.0;    // B / CONTINUATION (aligned, mid-structure) risk multiplier
+input double InpClassCSize        = 0.5;    // C / SOLO-COUNTER (weak/opposed) risk multiplier
+input double InpClassCTpATR       = 1.5;    // C-grade scalp hard take-profit distance (ATR)
 
 //==================================================================
 // 1D. INPUTS - ARC v2
@@ -1704,7 +1713,7 @@ bool IsTradeTime()
 //==================================================================
 // 15. ORDER EXECUTION HELPERS (RAW IOC)
 //==================================================================
-bool SendMarketOrder(int direction, double lots, double sl, const string comment)
+bool SendMarketOrder(int direction, double lots, double sl, const string comment, double tp = 0.0)
 {
    if(lots <= 0.0) return false;
    MqlTradeRequest req; MqlTradeResult res;
@@ -1716,7 +1725,7 @@ bool SendMarketOrder(int direction, double lots, double sl, const string comment
    req.magic        = InpMagic;
    req.volume       = lots;
    req.sl           = sl;
-   req.tp           = 0.0;
+   req.tp           = tp;
    req.deviation    = 20;
    req.type_filling = ORDER_FILLING_IOC;
    req.type_time    = ORDER_TIME_GTC;
@@ -2275,99 +2284,140 @@ void LogEntry(int dir, int tf, double entry, double sl, double lots, double zone
          "  range [dem ",DoubleToString(g_flipDemand,2)," / sup ",DoubleToString(g_flipSupply,2),"]");
 }
 
-// ===== DEEP CONTEXT EVALUATOR =====
-// The v1.6 P3/P4 phase is the TRIGGER. This folds the whole fractal model around it:
-// it SCORES the entry (confidence), classifies it, picks the zone-structural stop and
-// the owner-driven parent destination, scales risk by context, and hard-vetoes ONLY
-// when MTF bias + cascade + curve owner ALL oppose (price made a new extreme and the
-// whole structure rotated against the entry). Otherwise every v1.6 entry is preserved.
-struct EntryCtx
+// ===== DEEP CONTEXT MESH — preserve the v1.6 trigger, layer the model around it =====
+// The v1.6 P3/P4 phase is the TRIGGER (timing). The fractal model is the CONTEXT.
+// ===================================================================
+// LAYER 0 — SLOW CONTEXT ENVELOPE (event-driven, anti-flicker)
+// Per-direction permission that only transitions after opposition /
+// re-alignment has PERSISTED InpEnvConfirmBars bars, so context can
+// never flicker an entry away bar-to-bar. Publishes: permitted, regime
+// (0 expanding / 1 at-parent-target / 2 closed) and the parent destination.
+// ===================================================================
+struct Envelope
 {
-   bool   veto;
-   double confidence;   // 0..100
-   double sizeMult;     // risk multiplier
-   bool   atZone;
-   int    zoneTF;
-   double zonePrice;
+   bool   permitted;
+   int    regime;        // 0 expanding, 1 at-parent target, 2 closed/opposed
+   double destination;   // active parent target price
    int    destTF;
-   double destPrice;
    double destRoomATR;
-   string tag;          // short classification for the order comment
-   string note;         // full context line for the journal
+   int    opposeCnt;
+   int    alignCnt;
 };
+Envelope gEnvL, gEnvS;
 
-void EvalEntryContext(int dir, double px, double atr, EntryCtx &e)
+void UpdateOneEnvelope(int dir, Envelope &e, double px, double atr)
 {
-   e.veto = false; e.confidence = 50.0; e.sizeMult = 1.0;
-   e.atZone = false; e.zoneTF = -1; e.zonePrice = 0.0;
-   e.destTF = -1; e.destPrice = 0.0; e.destRoomATR = 1e9;
-   e.tag = "RAW"; e.note = "context off";
-   if(!InpCtxIntegrate) return;   // pure v1.6 behaviour
+   int  mb  = MTFBias();
+   int  cas = g_cascadeDir;
+   int  own = (dir == 1) ? gLong.m_ownDir : gShort.m_ownDir;
+   bool fullyOpposed = (mb == -dir) && (cas == -dir) && (own == -dir);
 
-   double conf = 30.0;   // base for a valid P3/P4 trigger
+   if(!InpEnvelopeSlow)
+      e.permitted = !fullyOpposed;
+   else
+   {
+      if(fullyOpposed) { e.opposeCnt++; e.alignCnt = 0; }
+      else             { e.alignCnt++;  e.opposeCnt = 0; }
+      if(e.opposeCnt >= InpEnvConfirmBars) e.permitted = false;   // sticky CLOSE
+      if(e.alignCnt  >= InpEnvConfirmBars) e.permitted = true;    // sticky OPEN
+   }
 
-   // 1. MTF directional bias - higher TFs weigh more
-   int  mb         = MTFBias();
-   bool mtfAligned = (mb == dir);
-   bool mtfOpposed = (mb == -dir);
-   if(mtfAligned)      conf += 22.0;
-   else if(mb == 0)    conf += 8.0;
-   else                conf -= 6.0;
-
-   // 2. rotation cascade - lower TFs lead, deeper aligned cascade = stronger
-   bool casAligned = (g_cascadeDir == dir);
-   bool casOpposed = (g_cascadeDir == -dir);
-   if(casAligned) conf += MathMin(20.0, 6.0 + g_cascadeDepth * 3.0);
-
-   // 3. curve-tree owner
-   int  ownDir     = (dir == 1) ? gLong.m_ownDir : gShort.m_ownDir;
-   bool ownAligned = (ownDir == dir);
-   bool ownOpposed = (ownDir == -dir);
-   if(ownAligned)      conf += 14.0;
-   else if(ownOpposed) conf -= 14.0;
-
-   // 4. at a higher-TF zone -> PREMIUM, structural stop + bigger context
-   int ztf = -1; double zp = 0.0;
-   if(AtHigherTFZone(dir, px, atr, ztf, zp))
-   { e.atZone = true; e.zoneTF = ztf; e.zonePrice = zp; conf += 18.0; }
-
-   // 5. cross-timeframe phase confluence
-   int pc = PhaseConfluence(dir);
-   conf += MathMin(16.0, pc * 3.0);
-
-   // 6. hunt-cycle alignment
-   if(InpUseHuntCycle && g_huntMode == dir)  conf += 8.0;
-   if(InpUseHuntCycle && g_huntMode == -dir) conf -= 6.0;
-
-   conf = Clamp(conf, 0.0, 100.0);
-   e.confidence = conf;
-
-   // owner-driven parent destination (the target this entry is travelling to)
    double room = 1e9; int dtf = -1;
-   e.destPrice   = (dir == 1) ? DestinationSupply(px, atr, dtf, room)
+   e.destination = (dir == 1) ? DestinationSupply(px, atr, dtf, room)
                               : DestinationDemand(px, atr, dtf, room);
    e.destTF      = dtf;
    e.destRoomATR = room;
 
-   // HARD VETO — only when the WHOLE structure opposes (this is the "new extreme then
-   // full rotation against us" case the user flagged), or below an explicit conf floor.
-   if(InpCtxVetoOpposition && mtfOpposed && casOpposed && ownOpposed) e.veto = true;
-   if(conf < InpCtxMinConfidence) e.veto = true;
+   if(!e.permitted)                      e.regime = 2;
+   else if(room <= InpParentApproachATR) e.regime = 1;   // at the parent target -> don't initiate
+   else                                  e.regime = 0;
+}
 
-   // risk multiplier from confidence
-   e.sizeMult = InpCtxSizeMinMult + (InpCtxSizeMaxMult - InpCtxSizeMinMult) * (conf / 100.0);
+void UpdateEnvelopes()
+{
+   double px  = Close[1];
+   double atr = GetATR(1); if(atr <= 0.0) atr = 1e-6;
+   UpdateOneEnvelope(1,  gEnvL, px, atr);
+   UpdateOneEnvelope(-1, gEnvS, px, atr);
+}
 
-   // classification + journal note
-   string cls = e.atZone ? ("PRIM@" + g_mtfLbl[ztf])
-              : (casAligned || mtfAligned) ? "CONT" : "SOLO";
-   e.tag  = cls;
-   e.note = cls + " cf" + DoubleToString(conf, 0) + " x" + DoubleToString(e.sizeMult, 2)
+// ===================================================================
+// LAYER 2/3 — CLASSIFY + POLICY (the v1.6 trigger is never gated here;
+// it is routed into a class with its own size / stop / target, and
+// hard-vetoed ONLY by the envelope arbitration above).
+//   class 0 = A PRIMARY  (at HTF zone, cascade aligned, owner not opposed)
+//   class 1 = B CONTINUATION (aligned, mid-structure)
+//   class 2 = C SOLO/COUNTER (weak/opposed -> micro scalp or skip)
+// ===================================================================
+struct EntryPlan
+{
+   bool   veto;
+   int    cls;
+   double sizeMult;
+   bool   useZoneStop;
+   double zonePrice;
+   int    zoneTF;
+   double tp;           // hard TP (0 = none, run by management)
+   int    destTF;
+   double destPrice;
+   double destRoomATR;
+   string tag;
+   string note;
+};
+
+void PlanEntry(int dir, double px, double atr, EntryPlan &p)
+{
+   p.veto = false; p.cls = 1; p.sizeMult = 1.0; p.useZoneStop = false;
+   p.zonePrice = 0.0; p.zoneTF = -1; p.tp = 0.0;
+   p.destTF = -1; p.destPrice = 0.0; p.destRoomATR = 1e9;
+   p.tag = "RAW"; p.note = "context off";
+   if(!InpCtxIntegrate) return;   // pure v1.6 behaviour
+
+   Envelope e = (dir == 1) ? gEnvL : gEnvS;
+   p.destTF = e.destTF; p.destPrice = e.destination; p.destRoomATR = e.destRoomATR;
+
+   int  mb  = MTFBias();
+   int  cas = g_cascadeDir;
+   int  own = (dir == 1) ? gLong.m_ownDir : gShort.m_ownDir;
+   int  pc  = PhaseConfluence(dir);
+   int  ztf = -1; double zp = 0.0;
+   bool atZone = AtHigherTFZone(dir, px, atr, ztf, zp);
+   p.zoneTF = ztf; p.zonePrice = zp;
+
+   // ---- ARBITRATION VETO — the ONLY place context blocks an entry ----
+   if(InpCtxVetoOpposition && e.regime == 2)        // envelope CLOSED: whole structure rotated against us
+   { p.veto = true; p.cls = 2; p.tag = "VETO-OPP"; }
+   else if(e.regime == 1)                           // price AT the parent target it's aiming for -> don't initiate
+   { p.veto = true; p.cls = 2; p.tag = "VETO-ATPARENT"; }
+
+   // ---- CLASSIFY + POLICY ----
+   if(!p.veto)
+   {
+      bool aligned = (cas == dir) || (mb == dir);
+      bool ownerOK = (own != -dir);
+      if(atZone && (cas == dir) && ownerOK) { p.cls = 0; p.tag = "PRIM@" + g_mtfLbl[ztf]; }
+      else if(aligned)                      { p.cls = 1; p.tag = "CONT"; }
+      else                                  { p.cls = 2; p.tag = "SOLO"; }
+
+      if(p.cls == 0)        // A PRIMARY: larger size, structural zone stop, run to parent via management
+      { p.sizeMult = InpClassASize; p.useZoneStop = (InpCtxZoneStop && atZone); }
+      else if(p.cls == 1)   // B CONTINUATION: normal size, anchor stop, management target
+      { p.sizeMult = InpClassBSize; }
+      else                  // C SOLO/COUNTER: micro scalp with a tight hard TP, or skip
+      {
+         if(!InpClassCTrade) { p.veto = true; p.tag = "SKIP-C"; }
+         else { p.sizeMult = InpClassCSize; p.tp = px + dir * InpClassCTpATR * atr; }
+      }
+   }
+
+   p.note = p.tag
+          + " cls" + IntegerToString(p.cls) + " x" + DoubleToString(p.sizeMult, 2)
+          + " | env " + (e.permitted ? "OPEN" : "CLOSED") + " reg" + IntegerToString(e.regime)
           + " | MTF " + (mb==1?"^":mb==-1?"v":"-")
-          + " cas " + (g_cascadeDir==1?"^":g_cascadeDir==-1?"v":"-") + IntegerToString(g_cascadeDepth)
-          + " own " + (ownDir==1?"^":ownDir==-1?"v":"-")
+          + " cas " + (cas==1?"^":cas==-1?"v":"-") + IntegerToString(g_cascadeDepth)
+          + " own " + (own==1?"^":own==-1?"v":"-")
           + " conf " + IntegerToString(pc) + "TF"
-          + " dest " + (dtf>=0?g_mtfLbl[dtf]:"-") + " " + DoubleToString(room,1) + "ATR"
-          + (e.veto?" [VETO opposition]":"");
+          + " dest " + (p.destTF>=0?g_mtfLbl[p.destTF]:"-") + " " + DoubleToString(p.destRoomATR,1) + "ATR";
 }
 
 void ExecuteTrading()
@@ -2400,24 +2450,28 @@ void ExecuteTrading()
          bool breakout = (close > gL_anchorHigh || close > High[2] + 0.20 * atr);
          if(L3 || (L4 && breakout))
          {
-            EntryCtx e; EvalEntryContext(1, close, atr, e);
-            if(!e.veto)
+            EntryPlan p; PlanEntry(1, close, atr, p);
+            bool live = !InpCtxShadowMode;
+            if(InpCtxShadowMode && InpDebugLog) Print("   SHADOW L: ", (p.veto?"[would-VETO] ":""), p.note);
+            if(!live || !p.veto)
             {
                double entry = close;
                double sl    = gL_anchorLow - atr * 0.25;
-               if(InpCtxZoneStop && e.atZone) sl = e.zonePrice - InpZoneSLBufferATR * atr; // structural zone stop
+               if(live && p.useZoneStop) sl = p.zonePrice - InpZoneSLBufferATR * atr; // structural zone stop
                double minD  = InpMinSLATR * atr;
                if(entry - sl < minD) sl = entry - minD;     // floor the stop distance
                if(sl > 0.0 && entry > sl)
                {
-                  double lots = ComputeLots(riskCash, entry, sl) * e.sizeMult;   // context-scaled risk
+                  double sm   = live ? p.sizeMult : 1.0;
+                  double tp   = live ? p.tp : 0.0;
+                  double lots = ComputeLots(riskCash, entry, sl) * sm;   // class-scaled risk
                   lots = AdjustLotsForBasketCeiling(1, entry, sl, lots);
-                  string cmt = (L4 ? "SYM P4L " : "SYM P3L ") + e.tag;
-                  if(lots > 0.0 && SendMarketOrder(+1, lots, sl, cmt))
+                  string cmt = (L4 ? "SYM P4L " : "SYM P3L ") + p.tag;
+                  if(lots > 0.0 && SendMarketOrder(+1, lots, sl, cmt, tp))
                   {
                      gL_lastTradeTime = barTime;
-                     if(InpDebugLog) Print("   CTX  L  : ", e.note);
-                     LogEntry(1, (e.zoneTF >= 0 ? e.zoneTF : 2), entry, sl, lots, (e.atZone ? e.zonePrice : gL_anchorLow));
+                     if(InpDebugLog) Print("   CTX  L  : ", p.note);
+                     LogEntry(1, (p.zoneTF >= 0 ? p.zoneTF : 2), entry, sl, lots, (p.useZoneStop ? p.zonePrice : gL_anchorLow));
                   }
                }
             }
@@ -2432,24 +2486,28 @@ void ExecuteTrading()
          bool breakout = (close < gS_anchorLow || close < Low[2] - 0.20 * atr);
          if(S3 || (S4 && breakout))
          {
-            EntryCtx e; EvalEntryContext(-1, close, atr, e);
-            if(!e.veto)
+            EntryPlan p; PlanEntry(-1, close, atr, p);
+            bool live = !InpCtxShadowMode;
+            if(InpCtxShadowMode && InpDebugLog) Print("   SHADOW S: ", (p.veto?"[would-VETO] ":""), p.note);
+            if(!live || !p.veto)
             {
                double entry = close;
                double sl    = gS_anchorHigh + atr * 0.25;
-               if(InpCtxZoneStop && e.atZone) sl = e.zonePrice + InpZoneSLBufferATR * atr; // structural zone stop
+               if(live && p.useZoneStop) sl = p.zonePrice + InpZoneSLBufferATR * atr; // structural zone stop
                double minD  = InpMinSLATR * atr;
                if(sl - entry < minD) sl = entry + minD;     // floor the stop distance
                if(sl > 0.0 && sl > entry)
                {
-                  double lots = ComputeLots(riskCash, entry, sl) * e.sizeMult;   // context-scaled risk
+                  double sm   = live ? p.sizeMult : 1.0;
+                  double tp   = live ? p.tp : 0.0;
+                  double lots = ComputeLots(riskCash, entry, sl) * sm;   // class-scaled risk
                   lots = AdjustLotsForBasketCeiling(-1, entry, sl, lots);
-                  string cmt = (S4 ? "SYM P4S " : "SYM P3S ") + e.tag;
-                  if(lots > 0.0 && SendMarketOrder(-1, lots, sl, cmt))
+                  string cmt = (S4 ? "SYM P4S " : "SYM P3S ") + p.tag;
+                  if(lots > 0.0 && SendMarketOrder(-1, lots, sl, cmt, tp))
                   {
                      gS_lastTradeTime = barTime;
-                     if(InpDebugLog) Print("   CTX  S  : ", e.note);
-                     LogEntry(-1, (e.zoneTF >= 0 ? e.zoneTF : 2), entry, sl, lots, (e.atZone ? e.zonePrice : gS_anchorHigh));
+                     if(InpDebugLog) Print("   CTX  S  : ", p.note);
+                     LogEntry(-1, (p.zoneTF >= 0 ? p.zoneTF : 2), entry, sl, lots, (p.useZoneStop ? p.zonePrice : gS_anchorHigh));
                   }
                }
             }
@@ -2758,6 +2816,10 @@ int OnInit()
    gShort.Init(-1);
    g_prevCascadeDir = 0; g_sellContext = false; g_buyContext = false; g_sellCtxTF = -1; g_buyCtxTF = -1;
    g_huntMode = 0; g_flip = 0.0; g_flipSupply = 0.0; g_flipDemand = 0.0;
+   gEnvL.permitted = true; gEnvL.regime = 0; gEnvL.opposeCnt = 0; gEnvL.alignCnt = 0;
+   gEnvL.destination = 0.0; gEnvL.destTF = -1; gEnvL.destRoomATR = 1e9;
+   gEnvS.permitted = true; gEnvS.regime = 0; gEnvS.opposeCnt = 0; gEnvS.alignCnt = 0;
+   gEnvS.destination = 0.0; gEnvS.destTF = -1; gEnvS.destRoomATR = 1e9;
    g_longMatured = false; g_shortMatured = false; g_longNewHigh = false; g_shortNewLow = false;
    g_longCycHigh = 0.0; g_shortCycLow = 0.0; g_longOriginPrice = 0.0; g_shortOriginPrice = 0.0;
 
@@ -2806,6 +2868,9 @@ void OnTick()
 
    // 4. recursive curve trees + life + lineage + chain (per campaign)
    UpdateCampaigns();
+
+   // 4b. LAYER 0 slow context envelope (needs MTF bias + cascade + curve owner)
+   UpdateEnvelopes();
 
    // 5. ARC targets (per direction)
    UpdateARC();

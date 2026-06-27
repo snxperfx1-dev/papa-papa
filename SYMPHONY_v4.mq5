@@ -2612,11 +2612,11 @@ void OnTick()
    // 2. structure + per-direction phase (multi-campaign)
    UpdateStructure();
 
-   // 3. multi-timeframe curve map (structural direction) + per-TF P3/P4 engines
    // 3. multi-timeframe curve map (structure: dir + zones + phase, one coherent read) + cascade
    UpdateMTFMap();
    ComputeCascade();
    UpdateZoneContext();
+   UpdateMaturity();        // before the hunt cycle: parent-TP gate needs CURRENT maturity
    ComputeFlip();
    UpdateHuntCycle();
 
@@ -2627,7 +2627,6 @@ void OnTick()
    UpdateARC();
 
    // 6. stop protection + profit ladder
-   UpdateMaturity();
    RunStopProtection();
    RunProfitLadder();
 

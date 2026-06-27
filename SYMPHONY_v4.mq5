@@ -1283,26 +1283,29 @@ void ComputeFlip()
    }
 }
 
-// Ride to the flip = take profit, then AUTO-SWITCH hunt direction. When flat, the
-// hunt mode aligns to which side of the flip price is on (below = hunt buys at demand,
-// above = hunt sells at supply).
+// Ride pullback-legs to the PARENT TARGET, then TP + AUTO-SWITCH. The controlling-HTF
+// SUPPLY is the up-cycle target, its DEMAND the down-cycle target. Within the leg the
+// rotations are pullbacks (re-buys at lower-TF demands), NOT reversals — the reversal
+// is only when price reaches the opposite parent pole. When flat, hunt aligns to which
+// half of the HTF range price sits in.
 void UpdateHuntCycle()
 {
-   if(!InpUseHuntCycle || g_flip <= 0.0) return;
+   if(!InpUseHuntCycle) return;
+   if(g_flipSupply <= 0.0 || g_flipDemand <= 0.0 || g_flipSupply <= g_flipDemand) return;
    double px   = Close[1];
    double band = InpFlipBandATR * GetATR(1);
    int longPos  = CountDirectionPositions(1);
    int shortPos = CountDirectionPositions(-1);
 
-   // long ran up into the flip -> TP and switch to hunting sells above the flip
-   if(g_huntMode == 1 && longPos > 0 && px >= g_flip - band)
-   { CloseDirection(1, "SYM TP FLIP long"); g_huntMode = -1; return; }
-   // short ran down into the flip -> TP and switch to hunting buys below the flip
-   if(g_huntMode == -1 && shortPos > 0 && px <= g_flip + band)
-   { CloseDirection(-1, "SYM TP FLIP short"); g_huntMode = 1; return; }
+   // up-cycle expanded into the PARENT SUPPLY -> take profit, switch to hunting sells
+   if(g_huntMode == 1 && px >= g_flipSupply - band)
+   { if(longPos > 0) CloseDirection(1, "SYM TP PARENT supply"); g_huntMode = -1; return; }
+   // down-cycle expanded into the PARENT DEMAND -> take profit, switch to hunting buys
+   if(g_huntMode == -1 && px <= g_flipDemand + band)
+   { if(shortPos > 0) CloseDirection(-1, "SYM TP PARENT demand"); g_huntMode = 1; return; }
 
-   // flat: align the hunt to price's side of the flip
-   if(longPos == 0 && shortPos == 0)
+   // init / realign when flat: lower half of the HTF range -> expand UP; upper half -> expand DOWN
+   if(g_huntMode == 0 || (longPos == 0 && shortPos == 0))
       g_huntMode = (px < g_flip) ? 1 : -1;
 }
 
@@ -2201,8 +2204,8 @@ void LogEntry(int dir, int tf, double entry, double sl, double lots, double zone
    Print("   CURVE   : Llife ",DoubleToString(gLong.m_life,0)," ownDir ",IntegerToString(gLong.m_ownDir),
          " | Slife ",DoubleToString(gShort.m_life,0)," ownDir ",IntegerToString(gShort.m_ownDir),
          " | conf L",IntegerToString(PhaseConfluence(1)),"/S",IntegerToString(PhaseConfluence(-1)));
-   Print("   HUNT    : mode ",(g_huntMode==1?"BUY<flip":g_huntMode==-1?"SELL>flip":"-"),
-         "  flip ",DoubleToString(g_flip,2)," [dem ",DoubleToString(g_flipDemand,2)," / sup ",DoubleToString(g_flipSupply,2),"]");
+   Print("   HUNT    : ",(g_huntMode==1?"BUY -> PARENT supply":g_huntMode==-1?"SELL -> PARENT demand":"-"),
+         "  range [dem ",DoubleToString(g_flipDemand,2)," / sup ",DoubleToString(g_flipSupply,2),"]");
 }
 
 void ExecuteTrading()
@@ -2228,7 +2231,7 @@ void ExecuteTrading()
 
    // BUY: confirmed bullish rotation + price AT a higher-TF DEMAND zone + P3/P4 timing
    if(cdir == 1 && !blockLong && g_longLastEntryBar != g_barCount && CurveAllowsLong()
-      && (!InpUseHuntCycle || g_flip <= 0.0 || (g_huntMode == 1 && close < g_flip))   // hunt BUYS below the flip
+      && (!InpUseHuntCycle || g_flipSupply <= 0.0 || (g_huntMode == 1 && close < g_flipSupply))  // buy cycle: room up to the PARENT supply
       && (!InpRequireMajorZoneOrigin || g_buyContext)
       && AtHigherTFZone(1, close, atr, tf, zone)
       && (!InpRequirePhaseTrigger || PhaseTrigger(1))
@@ -2249,7 +2252,7 @@ void ExecuteTrading()
 
    // SELL: confirmed bearish rotation + price AT a higher-TF SUPPLY zone + P3/P4 timing
    if(cdir == -1 && !blockShort && g_shortLastEntryBar != g_barCount && CurveAllowsShort()
-      && (!InpUseHuntCycle || g_flip <= 0.0 || (g_huntMode == -1 && close > g_flip))  // hunt SELLS above the flip
+      && (!InpUseHuntCycle || g_flipDemand <= 0.0 || (g_huntMode == -1 && close > g_flipDemand)) // sell cycle: room down to the PARENT demand
       && (!InpRequireMajorZoneOrigin || g_sellContext)
       && AtHigherTFZone(-1, close, atr, tf, zone)
       && (!InpRequirePhaseTrigger || PhaseTrigger(-1))
@@ -2403,8 +2406,8 @@ void UpdateDashboard()
    s += "CONTEXT: " + (g_buyContext ? ("BUY from "+(g_buyCtxTF>=0?g_mtfLbl[g_buyCtxTF]:"?")+" demand")
                      : g_sellContext ? ("SELL from "+(g_sellCtxTF>=0?g_mtfLbl[g_sellCtxTF]:"?")+" supply")
                      : "none (await major-zone reversal)") + nl;
-   s += "HUNT: " + (g_huntMode==1?"BUY (below flip)":g_huntMode==-1?"SELL (above flip)":"-")
-      + "  flip " + DoubleToString(g_flip,2) + " [dem " + DoubleToString(g_flipDemand,2) + " / sup " + DoubleToString(g_flipSupply,2) + "]" + nl;
+   s += "HUNT: " + (g_huntMode==1?"BUY -> PARENT supply":g_huntMode==-1?"SELL -> PARENT demand":"-")
+      + "  range [dem " + DoubleToString(g_flipDemand,2) + " / sup " + DoubleToString(g_flipSupply,2) + "]" + nl;
    // fractal entry target: the rotated group reacts against this NEXT-up TF zone
    int pTF = g_cascadeDepth; if(pTF < 1) pTF = 1; if(pTF > 8) pTF = 8;
    double pzt = (g_cascadeDir==1) ? g_mtfDemand[pTF] : (g_cascadeDir==-1) ? g_mtfSupply[pTF] : 0.0;

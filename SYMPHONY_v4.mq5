@@ -96,6 +96,9 @@ input bool   InpUsePhaseInNode    = true;   // Feed phase context into curve-tre
 input bool   InpBlockCounterProfit= true;   // Don't open one side while the OTHER book is net profitable
 input bool   InpUseMTFDirection   = true;   // DIRECTION: only trade with the MTF map's net bias
 input bool   InpMTFRequireRungAgree = true; // also require the entry TF's own structure to agree (not opposed)
+input double InpMTFBiasDeadband   = 3.0;    // |weighted bias| <= this = balanced (one top TF can't veto aligned lower TFs)
+input int    InpRotTFa            = 1;      // rotation TF A index (default 1=M5)
+input int    InpRotTFb            = 2;      // rotation TF B index (default 2=M15)
 input bool   InpTradeAllTF        = true;   // Fire P3/P4 from every timeframe curve (not just chart)
 input int    InpEntryFromTFIndex  = 0;      // Lowest entry timeframe (0=M1 1=M5 2=M15 3=H1 4=H4 5=D1)
 
@@ -1065,17 +1068,25 @@ double DestinationDemand(double px, double atr, int &tfOut, double &roomATR)
 // Net MTF DIRECTION authority: higher timeframes weigh more (owner = higher TF).
 // Returns +1 bullish bias, -1 bearish bias, 0 balanced. This is the direction the
 // algo is ALLOWED to trade — entries against it are blocked.
-int MTFBias()
-{
-   double sum = 0.0;
-   for(int i = 0; i < 6; i++) sum += (double)(i + 1) * (double)g_mtfDir[i]; // M1=1 .. D1=6
-   return (sum > 0.0) ? 1 : (sum < 0.0) ? -1 : 0;
-}
 double MTFBiasScore()
 {
    double sum = 0.0;
    for(int i = 0; i < 6; i++) sum += (double)(i + 1) * (double)g_mtfDir[i];
    return sum;   // range -21..+21
+}
+int MTFBias()
+{
+   double sum = MTFBiasScore();
+   if(MathAbs(sum) <= InpMTFBiasDeadband) return 0;   // balanced: one top TF can't veto aligned lower TFs
+   return (sum > 0.0) ? 1 : -1;
+}
+// Lower-timeframe ROTATION: both execution timeframes agree on a direction.
+// When the lower TFs rotate, they LEAD — don't trade against them.
+bool LowerTFRotation(int dir)
+{
+   int a = InpRotTFa, b = InpRotTFb;
+   if(a < 0 || a > 5 || b < 0 || b > 5) return false;
+   return (g_mtfDir[a] == dir && g_mtfDir[b] == dir);
 }
 
 //==================================================================
@@ -1876,10 +1887,16 @@ void ExecuteTrading()
    bool blockLong  = InpBlockCounterProfit && (GetDirectionFloatingPnL(-1) > 0.0);
    bool blockShort = InpBlockCounterProfit && (GetDirectionFloatingPnL(1)  > 0.0);
 
-   // MTF DIRECTION authority: only trade WITH the map's net bias.
-   int mtfBias = MTFBias();
-   if(InpUseMTFDirection && mtfBias == -1) blockLong  = true;   // map bearish -> no longs
-   if(InpUseMTFDirection && mtfBias ==  1) blockShort = true;   // map bullish -> no shorts
+   // MTF DIRECTION authority: only trade WITH the map's net bias, BUT lower-timeframe
+   // rotation overrides it — when the execution TFs rotate one way they lead, so we
+   // don't trade against them (this stops selling into an M5/M15 rotation up).
+   int  mtfBias = MTFBias();
+   bool rotUp   = InpUseMTFDirection && LowerTFRotation(1);
+   bool rotDn   = InpUseMTFDirection && LowerTFRotation(-1);
+   if(rotUp) blockShort = true;                                  // lower TFs rotating up -> no shorts
+   if(rotDn) blockLong  = true;                                  // lower TFs rotating down -> no longs
+   if(InpUseMTFDirection && mtfBias == -1 && !rotUp) blockLong  = true;   // bearish bias -> no longs (unless rotating up)
+   if(InpUseMTFDirection && mtfBias ==  1 && !rotDn) blockShort = true;   // bullish bias -> no shorts (unless rotating down)
 
    if(!InpTradeAllTF)
    {
@@ -2019,7 +2036,9 @@ void UpdateDashboard()
    int dbias = MTFBias();
    s += "MTF MAP:  " + MTF_StoryLine()
       + "  BIAS " + (dbias == 1 ? "^LONG-only" : dbias == -1 ? "vSHORT-only" : "-flat")
-      + " (" + DoubleToString(MTFBiasScore(),0) + ")" + nl;
+      + " (" + DoubleToString(MTFBiasScore(),0) + ")"
+      + (LowerTFRotation(1) ? "  ROT^ (no shorts)" : LowerTFRotation(-1) ? "  ROTv (no longs)" : "")
+      + nl;
    string tfp = "";
    for(int i = 0; i < 6; i++)
    {

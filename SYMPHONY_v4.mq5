@@ -107,6 +107,9 @@ input bool   InpRequireCleanRotation = false; // require a clean (bottom-led) ca
 input bool   InpRequirePhaseTrigger = true; // require a P3/P4 phase (timing) in the entry direction to fire
 input int    InpZoneFromTFIndex   = 0;      // lowest TF whose S/D zone can be traded (0 = M1)
 input int    InpZoneOpenAhead     = 0;      // open zones this many TFs ABOVE the cascade front (0 = up to the just-rotated TF)
+input bool   InpRequireMajorZoneOrigin = true; // SELL campaign must start at a major SUPPLY, BUY at a major DEMAND
+input int    InpMajorFromTFIndex  = 4;      // lowest TF treated as a MAJOR reversal zone (4 = H1)
+input double InpMajorZoneATR      = 3.0;    // the cascade flip must occur within this many ATR of the major zone
 // --- direction memory + cross-timeframe phase confluence ---
 input int    InpMTFConfirmBars    = 3;      // a TF's direction must confirm this many bars before it flips (anti-whipsaw)
 input bool   InpRequirePhaseConfluence = true; // entries must be nested under agreeing phases across timeframes
@@ -1124,6 +1127,14 @@ int  g_cascadeDir    = 0;
 int  g_cascadeDepth  = 0;
 bool g_cascadeClean  = false;
 int  g_cascadeNextTF = -1;
+// major-zone CONTEXT latch: a SELL campaign is born at a major SUPPLY, a BUY campaign
+// at a major DEMAND (the reversal zone). Set when the cascade flips direction AT a
+// major zone; the cascade then propagates and entries cascade along the leg.
+int  g_prevCascadeDir = 0;
+bool g_sellContext    = false;
+bool g_buyContext     = false;
+int  g_sellCtxTF      = -1;
+int  g_buyCtxTF       = -1;
 
 void ComputeCascade()
 {
@@ -1141,6 +1152,47 @@ void ComputeCascade()
       }
    }
    g_cascadeNextTF = (g_cascadeDepth > 0 && g_cascadeDepth < 8) ? g_cascadeDepth : -1;
+}
+
+// nearest MAJOR (higher-TF) zone to price: dir=-1 -> supply, dir=+1 -> demand.
+double NearestMajorZone(int dir, double px, double atr, int &tfOut, double &roomATR)
+{
+   tfOut = -1; roomATR = 1e9; double best = 0.0;
+   int lo = (InpMajorFromTFIndex < 0) ? 0 : (InpMajorFromTFIndex > 7 ? 7 : InpMajorFromTFIndex);
+   for(int i = lo; i < 8; i++)
+   {
+      double z = (dir == -1) ? g_mtfSupply[i] : g_mtfDemand[i];
+      if(z <= 0.0) continue;
+      double d = MathAbs(px - z) / MathMax(atr, 1e-9);
+      if(d < roomATR) { roomATR = d; tfOut = i; best = z; }
+   }
+   return best;
+}
+
+// Latch the campaign context on a cascade direction flip: bearish flip AT a major
+// supply -> sell context; bullish flip AT a major demand -> buy context.
+void UpdateZoneContext()
+{
+   if(g_cascadeDir == g_prevCascadeDir) return;     // only re-evaluate on a direction change
+   double px = Close[1], atr = GetATR(1); if(atr <= 0.0) atr = 1e-6;
+   int tf = -1; double room = 1e9;
+   if(g_cascadeDir == -1)
+   {
+      double z = NearestMajorZone(-1, px, atr, tf, room);
+      g_sellContext = (z > 0.0 && room <= InpMajorZoneATR);
+      g_sellCtxTF   = g_sellContext ? tf : -1;
+      g_buyContext  = false; g_buyCtxTF = -1;
+      g_prevCascadeDir = g_cascadeDir;
+   }
+   else if(g_cascadeDir == 1)
+   {
+      double z = NearestMajorZone(1, px, atr, tf, room);
+      g_buyContext = (z > 0.0 && room <= InpMajorZoneATR);
+      g_buyCtxTF   = g_buyContext ? tf : -1;
+      g_sellContext = false; g_sellCtxTF = -1;
+      g_prevCascadeDir = g_cascadeDir;
+   }
+   // g_cascadeDir == 0 -> keep the existing context until a real flip
 }
 
 // Lower-timeframe ROTATION (cascade-based): the rotation has climbed at least
@@ -1998,6 +2050,7 @@ void ExecuteTrading()
 
    // BUY: confirmed bullish rotation + price AT a higher-TF DEMAND zone + P3/P4 timing
    if(cdir == 1 && !blockLong && g_longLastEntryBar != g_barCount && CurveAllowsLong()
+      && (!InpRequireMajorZoneOrigin || g_buyContext)
       && AtHigherTFZone(1, close, atr, tf, zone)
       && (!InpRequirePhaseTrigger || PhaseTrigger(1))
       && (!InpRequirePhaseConfluence || PhaseConfluence(1) >= InpMinPhaseConfluence))
@@ -2015,6 +2068,7 @@ void ExecuteTrading()
 
    // SELL: confirmed bearish rotation + price AT a higher-TF SUPPLY zone + P3/P4 timing
    if(cdir == -1 && !blockShort && g_shortLastEntryBar != g_barCount && CurveAllowsShort()
+      && (!InpRequireMajorZoneOrigin || g_sellContext)
       && AtHigherTFZone(-1, close, atr, tf, zone)
       && (!InpRequirePhaseTrigger || PhaseTrigger(-1))
       && (!InpRequirePhaseConfluence || PhaseConfluence(-1) >= InpMinPhaseConfluence))
@@ -2162,6 +2216,9 @@ void UpdateDashboard()
       + (cblk=="" ? "-" : cblk) + "] next "
       + (g_cascadeNextTF>=0 ? g_mtfLbl[g_cascadeNextTF] : "full")
       + (g_cascadeClean ? " clean" : " mixed") + nl;
+   s += "CONTEXT: " + (g_buyContext ? ("BUY from "+(g_buyCtxTF>=0?g_mtfLbl[g_buyCtxTF]:"?")+" demand")
+                     : g_sellContext ? ("SELL from "+(g_sellCtxTF>=0?g_mtfLbl[g_sellCtxTF]:"?")+" supply")
+                     : "none (await major-zone reversal)") + nl;
    string rage = "ROT age: ";
    for(int ri = 0; ri < 8; ri++)
       rage += g_mtfLbl[ri] + " " + (g_mtfRotBar[ri] > 0 ? IntegerToString(g_barCount - g_mtfRotBar[ri]) : "-") + "  ";
@@ -2260,6 +2317,7 @@ int OnInit()
    // curve campaigns
    gLong.Init(1);
    gShort.Init(-1);
+   g_prevCascadeDir = 0; g_sellContext = false; g_buyContext = false; g_sellCtxTF = -1; g_buyCtxTF = -1;
 
    // per-timeframe structure engines + ATR handles
    for(int i = 0; i < 8; i++)
@@ -2299,6 +2357,7 @@ void OnTick()
    // 3. multi-timeframe curve map (structural direction) + per-TF P3/P4 engines
    UpdateMTFMap();
    ComputeCascade();
+   UpdateZoneContext();
    UpdateMTFEngines();
 
    // 4. recursive curve trees + life + lineage + chain (per campaign)

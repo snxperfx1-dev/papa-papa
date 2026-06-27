@@ -107,7 +107,7 @@ input bool   InpRequireCleanRotation = false; // require a clean (bottom-led) ca
 input bool   InpRequirePhaseTrigger = true; // require a P3/P4 phase (timing) in the entry direction to fire
 input int    InpZoneFromTFIndex   = 0;      // lowest TF whose S/D zone can be traded (0 = M1)
 input int    InpZoneOpenAhead     = 0;      // open zones this many TFs ABOVE the cascade front (0 = up to the just-rotated TF)
-input bool   InpRequireMajorZoneOrigin = true; // SELL campaign must start at a major SUPPLY, BUY at a major DEMAND
+input bool   InpRequireMajorZoneOrigin = false; // (optional) extra: also require the cascade FLIP to occur at a fixed major TF zone
 input int    InpMajorFromTFIndex  = 4;      // lowest TF treated as a MAJOR reversal zone (4 = H1)
 input double InpMajorZoneATR      = 3.0;    // the cascade flip must occur within this many ATR of the major zone
 // --- direction memory + cross-timeframe phase confluence ---
@@ -2004,20 +2004,19 @@ bool CurveAllowsShort()
    return true;
 }
 
-// Is price AT an OPENED-UP timeframe zone? dir=+1 -> DEMAND (support) to BUY from;
-// dir=-1 -> SUPPLY (resistance) to SELL from. The rotation OPENS zones from a low
-// floor (InpZoneFromTFIndex, e.g. M5) up to just ahead of how far the cascade has
-// climbed (g_cascadeDepth + InpZoneOpenAhead) — so an M1-led rotation makes M5/M15
-// tradeable, and higher zones open as the rotation propagates up.
+// FRACTAL entry zone: the rotated lower-TF group [M1..front] reacts against the NEXT
+// timeframe UP (front+1 = g_cascadeDepth). dir=+1 -> that parent's DEMAND to BUY from;
+// dir=-1 -> that parent's SUPPLY to SELL from. As the cascade climbs, the parent climbs
+// with it: [M1,M5]->M15, [M1,M5,M15]->M30, ... [H1,H4]->D1, [H1,H4,D1]->W1.
 bool AtHigherTFZone(int dir, double px, double atr, int &tfOut, double &zoneOut)
 {
    tfOut = -1; zoneOut = 0.0;
-   int loZ = (InpZoneFromTFIndex < 0) ? 0 : (InpZoneFromTFIndex > 7 ? 7 : InpZoneFromTFIndex);
-   int hiZ = (g_cascadeDepth - 1) + InpZoneOpenAhead;   // up to the JUST-ROTATED (cascade-front) timeframe
-   if(hiZ > 7) hiZ = 7;
-   if(hiZ < loZ) hiZ = loZ;
+   int parent = g_cascadeDepth;                 // front index = depth-1, so parent = depth
+   if(parent < 1) parent = 1;
+   if(parent > 7) parent = 7;
+   int hi = parent + InpZoneOpenAhead; if(hi > 7) hi = 7;
    double bestD = 1e9;
-   for(int i = loZ; i <= hiZ; i++)
+   for(int i = parent; i <= hi; i++)
    {
       double z = (dir == 1) ? g_mtfDemand[i] : g_mtfSupply[i];
       if(z <= 0.0) continue;
@@ -2219,6 +2218,13 @@ void UpdateDashboard()
    s += "CONTEXT: " + (g_buyContext ? ("BUY from "+(g_buyCtxTF>=0?g_mtfLbl[g_buyCtxTF]:"?")+" demand")
                      : g_sellContext ? ("SELL from "+(g_sellCtxTF>=0?g_mtfLbl[g_sellCtxTF]:"?")+" supply")
                      : "none (await major-zone reversal)") + nl;
+   // fractal entry target: the rotated group reacts against this NEXT-up TF zone
+   int pTF = g_cascadeDepth; if(pTF < 1) pTF = 1; if(pTF > 7) pTF = 7;
+   double pz = (g_cascadeDir==1) ? g_mtfDemand[pTF] : (g_cascadeDir==-1) ? g_mtfSupply[pTF] : 0.0;
+   double prm = (pz>0.0) ? MathAbs(Close[1]-pz)/MathMax(GetATR(1),1e-9) : 0.0;
+   s += "ENTRY ZONE: [M1.." + (g_cascadeDepth>=1?g_mtfLbl[g_cascadeDepth-1]:"-") + "] -> " + g_mtfLbl[pTF] + " "
+      + (g_cascadeDir==1?"demand":g_cascadeDir==-1?"supply":"-") + " "
+      + (pz>0.0? DoubleToString(pz,2)+" ("+DoubleToString(prm,1)+" ATR)":"-") + nl;
    string rage = "ROT age: ";
    for(int ri = 0; ri < 8; ri++)
       rage += g_mtfLbl[ri] + " " + (g_mtfRotBar[ri] > 0 ? IntegerToString(g_barCount - g_mtfRotBar[ri]) : "-") + "  ";

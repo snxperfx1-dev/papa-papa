@@ -920,6 +920,8 @@ string          g_mtfLbl[6] = {"M1","M5","M15","H1","H4","D1"};
 int             g_mtfDir[6];
 double          g_mtfOrigin[6];
 double          g_mtfExtreme[6];
+double          g_mtfSupply[6];   // per-TF supply (structural swing HIGH) — resistance
+double          g_mtfDemand[6];   // per-TF demand (structural swing LOW)  — support
 
 bool IsPivotHighTF(ENUM_TIMEFRAMES tf, int c, int P)
 {
@@ -974,7 +976,32 @@ void TF_Read(ENUM_TIMEFRAMES tf, int &dir, double &origin, double &extreme)
 void UpdateMTFMap()
 {
    for(int i = 0; i < 6; i++)
+   {
       TF_Read(g_mtfTF[i], g_mtfDir[i], g_mtfOrigin[i], g_mtfExtreme[i]);
+      // each timeframe's own supply (swing high) and demand (swing low) zone,
+      // so the engine carries S/D coordinates for ALL timeframes at once and can
+      // reason about how the timeframes nest / interact.
+      if(g_mtfDir[i] != 0)
+      {
+         g_mtfSupply[i] = MathMax(g_mtfOrigin[i], g_mtfExtreme[i]);
+         g_mtfDemand[i] = MathMin(g_mtfOrigin[i], g_mtfExtreme[i]);
+      }
+      else { g_mtfSupply[i] = 0.0; g_mtfDemand[i] = 0.0; }
+   }
+}
+
+// Which timeframe's supply/demand is price currently sitting in/at (nearest, in ATR)?
+int NearestZoneTF(double px, double atr, bool wantSupply, double &roomATR)
+{
+   roomATR = 1e9; int best = -1;
+   for(int i = 0; i < 6; i++)
+   {
+      double lvl = wantSupply ? g_mtfSupply[i] : g_mtfDemand[i];
+      if(lvl <= 0.0) continue;
+      double r = MathAbs(lvl - px) / MathMax(atr, 1e-9);
+      if(r < roomATR) { roomATR = r; best = i; }
+   }
+   return best;
 }
 
 int MTF_Align(int campDir)
@@ -1597,42 +1624,29 @@ void RunProfitLadder()
 //   crossing below the dead threshold = ownership transferred =>
 //   close that direction's book ("DEAD - FLIP").
 //==================================================================
-// nearest higher-timeframe SUPPLY above price (the resistance a long is travelling into)
+// nearest higher-timeframe SUPPLY above price (resistance a long is travelling into),
+// drawn from the per-TF supply coordinates so all timeframes are considered.
 double ParentSupplyAbove(double px, double atr, double &roomATR)
 {
    roomATR = 1e9; double best = 0.0;
    int lo = (InpParentFromTFIndex < 0) ? 0 : (InpParentFromTFIndex > 5 ? 5 : InpParentFromTFIndex);
    for(int i = lo; i < 6; i++)
    {
-      double cand[3];
-      cand[0] = gTFEng[i].SanchorHigh;   // short-impulse origin high (supply)
-      cand[1] = gTFEng[i].LanchorHigh;   // long-impulse high (resistance)
-      cand[2] = gTFEng[i].SinducPrice;   // short flip / induc zone
-      for(int k = 0; k < 3; k++)
-      {
-         double v = cand[k];
-         if(v > px && (best == 0.0 || v < best)) best = v;   // nearest above
-      }
+      double v = g_mtfSupply[i];
+      if(v > px && (best == 0.0 || v < best)) best = v;   // nearest above
    }
    if(best > 0.0) roomATR = (best - px) / MathMax(atr, 1e-9);
    return best;
 }
-// nearest higher-timeframe DEMAND below price (the support a short is travelling into)
+// nearest higher-timeframe DEMAND below price (support a short is travelling into).
 double ParentDemandBelow(double px, double atr, double &roomATR)
 {
    roomATR = 1e9; double best = 0.0;
    int lo = (InpParentFromTFIndex < 0) ? 0 : (InpParentFromTFIndex > 5 ? 5 : InpParentFromTFIndex);
    for(int i = lo; i < 6; i++)
    {
-      double cand[3];
-      cand[0] = gTFEng[i].LanchorLow;    // long-impulse origin low (demand)
-      cand[1] = gTFEng[i].SanchorLow;    // short-impulse low (support)
-      cand[2] = gTFEng[i].LinducPrice;   // long flip / induc zone
-      for(int k = 0; k < 3; k++)
-      {
-         double v = cand[k];
-         if(v > 0.0 && v < px && v > best) best = v;   // nearest below
-      }
+      double v = g_mtfDemand[i];
+      if(v > 0.0 && v < px && v > best) best = v;   // nearest below
    }
    if(best > 0.0) roomATR = (px - best) / MathMax(atr, 1e-9);
    return best;
@@ -1990,6 +2004,16 @@ void UpdateDashboard()
       + " exp " + DoubleToString(dTravL,1)
       + " | S demand " + (dDemS>0.0? DoubleToString(dDemS,2)+" ("+DoubleToString(dRoomS,1)+" ATR)" : "-")
       + " exp " + DoubleToString(dTravS,1) + nl;
+   // per-TF supply/demand distance in ATR (up = +, down = -) so the interaction is visible
+   double pz = Close[1];
+   string zs = "ZONES(ATR): ";
+   for(int zi = 0; zi < 6; zi++)
+   {
+      string su = (g_mtfSupply[zi] > 0.0) ? DoubleToString((g_mtfSupply[zi]-pz)/MathMax(dAtr,1e-9),1) : "-";
+      string de = (g_mtfDemand[zi] > 0.0) ? DoubleToString((g_mtfDemand[zi]-pz)/MathMax(dAtr,1e-9),1) : "-";
+      zs += g_mtfLbl[zi] + " S" + su + "/D" + de + "  ";
+   }
+   s += zs + nl;
    s += "PHYS: comp " + DoubleToString(g_compIdx,0)
       + " (tighten " + DoubleToString(g_cmpTighten,0) + ")"
       + "  eff " + DoubleToString(g_eff,2)
@@ -2052,6 +2076,7 @@ int OnInit()
    {
       g_mtfATR[i]    = iATR(_Symbol, g_mtfTF[i], InpATRLen);
       g_mtfDir[i]    = 0; g_mtfOrigin[i] = 0.0; g_mtfExtreme[i] = 0.0;
+      g_mtfSupply[i] = 0.0; g_mtfDemand[i] = 0.0;
       g_mtfPhaseL[i] = 0; g_mtfPhaseS[i] = 0;
       ZeroMemory(gTFEng[i]);
       gTFEng[i].lastPivotDir = 0; gTFEng[i].prevPivotDir = 0;

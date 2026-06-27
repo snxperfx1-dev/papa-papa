@@ -97,15 +97,16 @@ input bool   InpBlockCounterProfit= true;   // Don't open one side while the OTH
 input bool   InpUseMTFDirection   = true;   // DIRECTION: only trade with the MTF map's net bias
 input bool   InpMTFRequireRungAgree = true; // also require the entry TF's own structure to agree (not opposed)
 input double InpMTFBiasDeadband   = 3.0;    // |weighted bias| <= this = balanced (one top TF can't veto aligned lower TFs)
-input int    InpRotCount          = 2;      // ROTATION = lowest N timeframes agree (2 = M1+M5 lead the rotation)
+input int    InpRotCount          = 1;      // ENTRY rotation: cascade must be >= this deep (1 = a single M1 rotation opens)
 input bool   InpUseRotationExit   = true;   // EXIT: a lower-TF rotation against the open book flattens it
+input int    InpRotExitCount      = 2;      // EXIT rotation depth: need this many TFs flipped against the book to flatten it
 // --- zone-based entries: buys at higher-TF demand, sells at higher-TF supply, when rotation confirmed ---
 input double InpZoneApproachATR   = 1.0;    // price must be within this many ATR of the higher-TF S/D zone to enter
 input double InpZoneSLBufferATR   = 0.5;    // stop placed this many ATR beyond the zone
 input bool   InpRequireCleanRotation = false; // require a clean (bottom-led) cascade before entering
 input bool   InpRequirePhaseTrigger = true; // require a P3/P4 phase (timing) in the entry direction to fire
-input int    InpZoneFromTFIndex   = 1;      // lowest TF whose S/D zone can be traded (1 = M5)
-input int    InpZoneOpenAhead     = 1;      // rotation opens zones up to this many TFs above the cascade front
+input int    InpZoneFromTFIndex   = 0;      // lowest TF whose S/D zone can be traded (0 = M1)
+input int    InpZoneOpenAhead     = 0;      // open zones this many TFs ABOVE the cascade front (0 = up to the just-rotated TF)
 // --- direction memory + cross-timeframe phase confluence ---
 input int    InpMTFConfirmBars    = 3;      // a TF's direction must confirm this many bars before it flips (anti-whipsaw)
 input bool   InpRequirePhaseConfluence = true; // entries must be nested under agreeing phases across timeframes
@@ -1838,8 +1839,8 @@ void ManageExits()
    // a "ROT^ (no shorts)" state must also flatten existing shorts, not just stop new ones.
    if(InpUseRotationExit)
    {
-      if(shortPos > 0 && LowerTFRotation(1))  { exitShort = true; reasonS = "ROT FLIP ^"; }
-      if(longPos  > 0 && LowerTFRotation(-1)) { exitLong  = true; reasonL = "ROT FLIP v"; }
+      if(shortPos > 0 && g_cascadeDir == 1  && g_cascadeDepth >= InpRotExitCount) { exitShort = true; reasonS = "ROT FLIP ^"; }
+      if(longPos  > 0 && g_cascadeDir == -1 && g_cascadeDepth >= InpRotExitCount) { exitLong  = true; reasonL = "ROT FLIP v"; }
    }
 
    // ---- arm-before-die: a campaign must first get HEALTHY before life can kill it,
@@ -1960,7 +1961,7 @@ bool AtHigherTFZone(int dir, double px, double atr, int &tfOut, double &zoneOut)
 {
    tfOut = -1; zoneOut = 0.0;
    int loZ = (InpZoneFromTFIndex < 0) ? 0 : (InpZoneFromTFIndex > 7 ? 7 : InpZoneFromTFIndex);
-   int hiZ = g_cascadeDepth + InpZoneOpenAhead;
+   int hiZ = (g_cascadeDepth - 1) + InpZoneOpenAhead;   // up to the JUST-ROTATED (cascade-front) timeframe
    if(hiZ > 7) hiZ = 7;
    if(hiZ < loZ) hiZ = loZ;
    double bestD = 1e9;

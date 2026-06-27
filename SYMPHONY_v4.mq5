@@ -90,6 +90,7 @@ input double InpExpandMinATR      = 2.0;    // owner curve must have travelled >
 input double InpParentApproachATR = 2.0;    // within this many ATR of parent S/D = "approaching"
 input int    InpParentFromTFIndex = 4;      // lowest TF index treated as parent (0=M1 1=M5 2=M15 3=M30 4=H1 5=H4 6=D1 7=W1)
 input bool   InpShowDashboard     = true;   // Print Comment() dashboard
+input bool   InpDebugLog          = true;   // Print full engine state to the journal on every entry
 // --- curve-tree entry gate + all-timeframe entries (LIFE NOT USED FOR ENTRIES) ---
 input bool   InpRequireCurveOwner = true;   // Require curve-tree owner not opposed to the entry dir
 input bool   InpUsePhaseInNode    = true;   // Feed phase context into curve-tree node state
@@ -1991,8 +1992,8 @@ void ManageExits()
    if(!exitShort && gS_modeInvalid && (gS_phaseAtInvalid == 3 || gS_phaseAtInvalid == 4))
    { exitShort = true; reasonS = "INVALID@PEAK"; }
 
-   if(exitLong)  { Print("SYM EXIT LONG  reason=",reasonL," life=",DoubleToString(gLong.m_life,0));  CloseDirection(1,  "SYM EXIT "+reasonL); }
-   if(exitShort) { Print("SYM EXIT SHORT reason=",reasonS," life=",DoubleToString(gShort.m_life,0)); CloseDirection(-1, "SYM EXIT "+reasonS); }
+   if(exitLong)  { Print("SYM EXIT LONG  reason=",reasonL," life=",DoubleToString(gLong.m_life,0));  if(InpDebugLog){ Print("   MTF: ",DbgMTFMap()); Print("   CASCADE: ",DbgCascade()); } CloseDirection(1,  "SYM EXIT "+reasonL); }
+   if(exitShort) { Print("SYM EXIT SHORT reason=",reasonS," life=",DoubleToString(gShort.m_life,0)); if(InpDebugLog){ Print("   MTF: ",DbgMTFMap()); Print("   CASCADE: ",DbgCascade()); } CloseDirection(-1, "SYM EXIT "+reasonS); }
 
    gL_modeInvalid = false;
    gS_modeInvalid = false;
@@ -2042,6 +2043,80 @@ bool AtHigherTFZone(int dir, double px, double atr, int &tfOut, double &zoneOut)
    return (tfOut >= 0);
 }
 
+// ===== JOURNAL DEBUG (full engine state on each entry) =====
+string DbgMTFMap()
+{
+   string s = "";
+   for(int i = 0; i < 9; i++) s += g_mtfLbl[i] + (g_mtfDir[i]==1?"^":g_mtfDir[i]==-1?"v":"-") + " ";
+   int b = MTFBias();
+   s += " BIAS " + (b==1?"^":b==-1?"v":"-") + "(" + DoubleToString(MTFBiasScore(),0) + ")";
+   return s;
+}
+string DbgCascade()
+{
+   string blk = "";
+   for(int i = 0; i < g_cascadeDepth && i < 9; i++) blk += g_mtfLbl[i] + (i < g_cascadeDepth-1 ? ">" : "");
+   return (g_cascadeDir==1?"^":g_cascadeDir==-1?"v":"-") + " depth " + IntegerToString(g_cascadeDepth) + "/9 ["
+        + (blk==""?"-":blk) + "] next " + (g_cascadeNextTF>=0?g_mtfLbl[g_cascadeNextTF]:"full")
+        + (g_cascadeClean?" clean":" mixed");
+}
+string DbgContext()
+{
+   return g_buyContext  ? ("BUY from "+(g_buyCtxTF>=0?g_mtfLbl[g_buyCtxTF]:"?")+" demand")
+        : g_sellContext ? ("SELL from "+(g_sellCtxTF>=0?g_mtfLbl[g_sellCtxTF]:"?")+" supply")
+        : "none";
+}
+string DbgTFPhase()
+{
+   string s = "";
+   for(int i = 0; i < 9; i++)
+   {
+      int pl = g_mtfPhaseL[i], ps = g_mtfPhaseS[i];
+      string c = g_mtfLbl[i] + ":";
+      if(pl >= 3)      c += "L"+IntegerToString(pl);
+      else if(ps >= 3) c += "S"+IntegerToString(ps);
+      else if(pl > 0)  c += "l"+IntegerToString(pl);
+      else if(ps > 0)  c += "s"+IntegerToString(ps);
+      else             c += "-";
+      s += c + " ";
+   }
+   return s;
+}
+string DbgRotAge()
+{
+   string s = "";
+   for(int i = 0; i < 9; i++) s += g_mtfLbl[i] + " " + (g_mtfRotBar[i]>0?IntegerToString(g_barCount-g_mtfRotBar[i]):"-") + " ";
+   return s;
+}
+string DbgDest(int dir)
+{
+   double atr = GetATR(1); int tf = -1; double room = 1e9;
+   double z = (dir==1) ? DestinationSupply(Close[1], atr, tf, room) : DestinationDemand(Close[1], atr, tf, room);
+   int own = OwnerTF(dir);
+   return "owner " + (own>=0?g_mtfLbl[own]:"-") + " -> " + (tf>=0?g_mtfLbl[tf]:"-") + " "
+        + (z>0.0?DoubleToString(z,2)+" ("+DoubleToString(room,1)+" ATR)":"-");
+}
+void LogEntry(int dir, int tf, double entry, double sl, double lots, double zone)
+{
+   if(!InpDebugLog) return;
+   string side = (dir==1)?"BUY":"SELL";
+   string zl   = (dir==1)?"demand":"supply";
+   Print("=== SYM ENTRY ",side," ",g_mtfLbl[tf]," ",zl," @ ",DoubleToString(entry,2),
+         "  SL ",DoubleToString(sl,2),"  lots ",DoubleToString(lots,2)," ===");
+   Print("   MTF MAP : ",DbgMTFMap());
+   Print("   CASCADE : ",DbgCascade());
+   Print("   CONTEXT : ",DbgContext());
+   Print("   ENTRYZN : [M1..",(g_cascadeDepth>=1?g_mtfLbl[g_cascadeDepth-1]:"-"),"] -> ",g_mtfLbl[tf]," ",zl," ",DoubleToString(zone,2));
+   Print("   TF PHASE: ",DbgTFPhase());
+   Print("   DEST    : ",DbgDest(dir));
+   Print("   ROT age : ",DbgRotAge());
+   Print("   PHYS    : comp ",DoubleToString(g_compIdx,0)," tighten ",DoubleToString(g_cmpTighten,0),
+         " eff ",DoubleToString(g_eff,2)," disp ",DoubleToString(g_disp,2));
+   Print("   CURVE   : Llife ",DoubleToString(gLong.m_life,0)," ownDir ",IntegerToString(gLong.m_ownDir),
+         " | Slife ",DoubleToString(gShort.m_life,0)," ownDir ",IntegerToString(gShort.m_ownDir),
+         " | conf L",IntegerToString(PhaseConfluence(1)),"/S",IntegerToString(PhaseConfluence(-1)));
+}
+
 void ExecuteTrading()
 {
    if((int)ArraySize(Close) < 3) return;
@@ -2077,7 +2152,7 @@ void ExecuteTrading()
          double lots = ComputeLots(riskCash, entry, sl);
          lots = AdjustLotsForBasketCeiling(1, entry, sl, lots);
          if(lots > 0.0 && SendMarketOrder(+1, lots, sl, "SYM BUY "+g_mtfLbl[tf]+" demand"))
-            g_longLastEntryBar = g_barCount;
+         { g_longLastEntryBar = g_barCount; LogEntry(1, tf, entry, sl, lots, zone); }
       }
    }
 
@@ -2095,7 +2170,7 @@ void ExecuteTrading()
          double lots = ComputeLots(riskCash, entry, sl);
          lots = AdjustLotsForBasketCeiling(-1, entry, sl, lots);
          if(lots > 0.0 && SendMarketOrder(-1, lots, sl, "SYM SELL "+g_mtfLbl[tf]+" supply"))
-            g_shortLastEntryBar = g_barCount;
+         { g_shortLastEntryBar = g_barCount; LogEntry(-1, tf, entry, sl, lots, zone); }
       }
    }
 }

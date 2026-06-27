@@ -98,6 +98,7 @@ input bool   InpUseMTFDirection   = true;   // DIRECTION: only trade with the MT
 input bool   InpMTFRequireRungAgree = true; // also require the entry TF's own structure to agree (not opposed)
 input double InpMTFBiasDeadband   = 3.0;    // |weighted bias| <= this = balanced (one top TF can't veto aligned lower TFs)
 input int    InpRotCount          = 2;      // ROTATION = lowest N timeframes agree (2 = M1+M5 lead the rotation)
+input bool   InpUseRotationExit   = true;   // EXIT: a lower-TF rotation against the open book flattens it
 // --- direction memory + cross-timeframe phase confluence ---
 input int    InpMTFConfirmBars    = 3;      // a TF's direction must confirm this many bars before it flips (anti-whipsaw)
 input bool   InpRequirePhaseConfluence = true; // entries must be nested under agreeing phases across timeframes
@@ -1798,6 +1799,15 @@ void ManageExits()
 
    int longPos  = CountDirectionPositions(1);
    int shortPos = CountDirectionPositions(-1);
+
+   // ---------- ROTATION-REVERSAL EXIT ----------
+   // A lower-timeframe rotation that turns AGAINST the open book closes it. This is why
+   // a "ROT^ (no shorts)" state must also flatten existing shorts, not just stop new ones.
+   if(InpUseRotationExit)
+   {
+      if(shortPos > 0 && LowerTFRotation(1))  { exitShort = true; reasonS = "ROT FLIP ^"; }
+      if(longPos  > 0 && LowerTFRotation(-1)) { exitLong  = true; reasonL = "ROT FLIP v"; }
+   }
 
    // ---- arm-before-die: a campaign must first get HEALTHY before life can kill it,
    //      and reset the arm/last-entry when the book is flat ----

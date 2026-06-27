@@ -230,6 +230,67 @@ datetime g_lastBarTime=0;
 double   gClose[],gHigh[],gLow[],gOpen[]; datetime gTime[];
 
 //==================================================================
+// F16 INTELLIGENCE LAYER — Invisible Network + Time + Opportunity
+//   Ported from the F16 Raptor v60 indicator. This is PURE CONTEXT:
+//   it scores / sizes / targets the spec entries. It NEVER changes the
+//   lifecycle entry trigger or the POI-precision stop loss — those stay
+//   the execution authority (entries own "when"; context owns "where /
+//   how much / which target"; they touch at ONE arbitration point).
+//==================================================================
+input group "═══ F16 Intelligence (context only) ═══"
+input bool   InpF16Enable      = true;   // master switch for the F16 context layer
+input double InpF16WickFrac    = 0.30;   // FU spike: min wick / range
+input int    InpF16Lookback    = 3;      // FU spike: structure lookback
+input double InpF16AuthMin      = 45.0;  // min node authority to count as live
+input int    InpF16NodeMax     = 250;    // max remembered nodes
+input int    InpF16DormantBars = 120;    // bars until a node goes dormant
+input int    InpF16HistoryBars = 600;    // bars until a node goes historical
+input bool   InpF16NetTarget   = true;   // use the nearest forward node as the runner TP2
+input bool   InpF16SizeByOpp   = true;   // scale risk% by the opportunity grade
+input double InpF16OppSizeMin  = 0.6;    // risk multiplier at 0 opportunity
+input double InpF16OppSizeMax  = 1.3;    // risk multiplier at 100 opportunity
+input bool   InpF16VetoFullOpp = false;  // (off) skip an entry ONLY when network+MTF+time ALL oppose it
+
+// --- node object (a remembered FU / flip level on some timeframe) ---
+struct F16Node {
+   double price;   // the FU wick tip = the node price
+   double mid;     // mid (tip<->body) = mitigation / 0.5 level
+   int    dir;     // +1 bullish rejection, -1 bearish rejection
+   double score;   // raw FU authority score
+   int    wt;      // TF weight (9=MN 8=W 7=D 6=H4 5=H1 4=M15 3=M5)
+   int    state;   // 0 active, 1 dormant, 2 consumed, 3 historical
+   int    bar;     // g_barCount at birth
+   int    rev;     // reaction count (times price revisited)
+};
+F16Node g_f16nodes[];
+
+// scanned timeframes (MN -> M5) and their authority weights
+ENUM_TIMEFRAMES g_f16tf[7] = {PERIOD_MN1,PERIOD_W1,PERIOD_D1,PERIOD_H4,PERIOD_H1,PERIOD_M15,PERIOD_M5};
+int             g_f16wt[7] = {9,8,7,6,5,4,3};
+
+// per-TF FU state (dedupe tip + confirmation latch)
+double g_f16prevTip[7];
+int    g_f16fuDir[7];
+double g_f16fuBodyHi[7], g_f16fuBodyLo[7];
+bool   g_f16fuConf[7];
+
+// network outputs
+int    g_f16netBias   = 0;
+double g_f16attrPrice = 0.0, g_f16attrScore = 0.0;  int g_f16attrWt = 0;
+double g_f16fezHi     = 0.0, g_f16fezLo     = 0.0;
+int    g_f16eligN     = 0;   double g_f16pressure = 0.0;  int g_f16pdir = 0;
+
+// Time Intelligence Engine outputs
+int    g_f16timeDir = 0;  double g_f16timeAlign = 50.0, g_f16timeConflict = 50.0;
+double g_f16h1LowProb = 50.0; string g_f16h1Timing = "-"; string g_f16tSeq = "-";
+
+// Opportunity synthesis outputs
+double g_f16alignment = 50.0, g_f16conflict = 0.0, g_f16confidence = 50.0;
+double g_f16threat = 0.0, g_f16opp = 0.0, g_f16biasStrength = 50.0;
+string g_f16oppGrade = "-"; int g_f16master = 0; double g_f16primProb = 50.0;
+double g_f16sizeMult = 1.0;
+
+//==================================================================
 // SERIES + BASIC HELPERS
 //==================================================================
 bool RefreshSeries(int need=800)
@@ -835,6 +896,8 @@ void AttemptEntry(int dir){
    if(CountPositions()>=InpMaxPositions) return;
    if(!ChecklistAllPass()) return;
    if(IsDeadZone()) return;
+   // F16 arbitration (optional, OFF by default): skip ONLY when network+MTF+time ALL oppose.
+   if(InpF16Enable && InpF16VetoFullOpp && F16_FullOpposition(dir)) return;
 
    double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK),bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
    double entry=(dir==1)?ask:bid; double prec=g_poi.precisionLevel;
@@ -849,12 +912,20 @@ void AttemptEntry(int dir){
    if(counter){ et=ENTRY_INDUCEMENT; riskPct=MathMin(riskPct,InpCounterRiskPct); }
    else if(stopPips>InpGoldStopMax){ et=ENTRY_AGGRESSIVE; riskPct*=InpAggrSizeMult; }
    if(g_reduceSizing) riskPct*=0.5;
+   // F16 context owns "how much": scale risk by the opportunity grade (entry trigger & SL unchanged)
+   if(InpF16Enable && InpF16SizeByOpp) riskPct=MathMax(0.05, riskPct*g_f16sizeMult);
 
    // TPs
    ENUM_TIMEFRAMES etf=g_tf[IDX_H4]; Swing sw[]; CollectSwingsTF(etf,sw,10);
    int t1=SwingRank(sw,(dir==1)?1:-1,0);
    double tp1=(t1>=0)?sw[t1].price:(dir==1?entry+PipsToPrice(InpHardTPPips):entry-PipsToPrice(InpHardTPPips));
    double tp2=(dir==1)?g_tfState[IDX_H4].externalHigh:g_tfState[IDX_H4].externalLow; if(tp2<=0.0)tp2=tp1;
+   // F16 context owns "which target": extend the runner to the dominant forward network node when it sits farther
+   if(InpF16Enable && InpF16NetTarget && g_f16attrPrice>0.0){
+      bool ahead =(dir==1)?(g_f16attrPrice>entry):(g_f16attrPrice<entry);
+      bool farther=(dir==1)?(g_f16attrPrice>tp2)  :(g_f16attrPrice<tp2);
+      if(ahead && farther) tp2=g_f16attrPrice;
+   }
    double hardTP=0.0;
    if(et==ENTRY_INDUCEMENT) hardTP=(dir==1)?entry+PipsToPrice(InpInducementTPPips):entry-PipsToPrice(InpInducementTPPips);
    else if(IsNearClose())   hardTP=(dir==1)?entry+PipsToPrice(InpHardTPPips):entry-PipsToPrice(InpHardTPPips);
@@ -872,7 +943,9 @@ void AttemptEntry(int dir){
       g_state=TS_OPEN_INITIAL; g_stateBar=g_barCount;
       Print("snX ENTRY ",(dir==1?"BUY":"SELL")," @",DoubleToString(entry,_Digits)," SL ",DoubleToString(sl,_Digits),
             " (",DoubleToString(stopPips,1),"p) lots ",DoubleToString(lots,2)," ",cmt," TP1 ",DoubleToString(tp1,_Digits),
-            " refTF ",g_tfLbl[g_poi.refinedTFidx]);
+            " refTF ",g_tfLbl[g_poi.refinedTFidx],
+            "  | F16 opp ",g_f16oppGrade," conf ",DoubleToString(g_f16confidence,0),
+            " sz x",DoubleToString(g_f16sizeMult,2)," attr ",(g_f16attrPrice>0.0?DoubleToString(g_f16attrPrice,_Digits):"-"));
    }
 }
 
@@ -1016,6 +1089,19 @@ void UpdateDashboard(){
    s+="SESS Syd "+DoubleToString(g_sydL,2)+"/"+DoubleToString(g_sydH,2)+(g_sydLRaid?"[L]":"")+(g_sydHRaid?"[H]":"")
      +"  Asia "+DoubleToString(g_asiaL,2)+"/"+DoubleToString(g_asiaH,2)
      +"  Lon "+DoubleToString(g_lonL,2)+"/"+DoubleToString(g_lonH,2)+nl;
+   if(InpF16Enable){
+      s+="------------------------------------------------------------"+nl;
+      s+="F16 NET "+(g_f16netBias==1?"^BULL":g_f16netBias==-1?"vBEAR":"-")
+        +"  nodes "+IntegerToString(ArraySize(g_f16nodes))+" ("+IntegerToString(g_f16eligN)+" live)"
+        +"  press "+DoubleToString(g_f16pressure,0)
+        +"  attr "+(g_f16attrPrice>0.0?DoubleToString(g_f16attrPrice,2):"-")+nl;
+      s+="F16 FEZ ["+(g_f16fezLo>0.0?DoubleToString(g_f16fezLo,2):"-")+" .. "+(g_f16fezHi>0.0?DoubleToString(g_f16fezHi,2):"-")+"]"
+        +"  TIME "+(g_f16timeDir==1?"^":g_f16timeDir==-1?"v":"-")+" align "+DoubleToString(g_f16timeAlign,0)
+        +"  H1 "+g_f16h1Timing+nl;
+      s+="F16 OPP "+g_f16oppGrade+" "+DoubleToString(g_f16opp,0)+"/100"
+        +"  conf "+DoubleToString(g_f16confidence,0)+"  threat "+DoubleToString(g_f16threat,0)
+        +"  size x"+DoubleToString(g_f16sizeMult,2)+"  path "+DoubleToString(g_f16primProb,0)+"%"+nl;
+   }
    Comment(s);
 }
 
@@ -1026,6 +1112,7 @@ void RunPipeline(){
    g_barCount++;
    BuildStructuralCascade();
    RebuildLiquidityMap();
+   F16_Update();          // F16 context layer: network / time / opportunity (scores+sizes+targets only)
    RunLifecycle();
 }
 
@@ -1060,3 +1147,191 @@ void OnTick(){
    if(InpShowDashboard) UpdateDashboard();
 }
 //+------------------------------------------------------------------+
+
+
+
+//==================================================================
+// F16 INTELLIGENCE ENGINE  (ported logic — no Pine UI)
+//   Invisible Network (multi-TF FU detector -> nodes -> authority ->
+//   FEZ -> attractor), Time Intelligence (cycle completion), and the
+//   Senseei Opportunity synthesis. Reads OHLC only; touches no orders.
+//==================================================================
+
+// manual ATR (avoids MQL5 indicator handles for 7 timeframes)
+double F16_ATR(ENUM_TIMEFRAMES tf,int period,int shift){
+   double sum=0.0; int n=0;
+   for(int i=shift;i<shift+period;i++){
+      double h=iHigh(_Symbol,tf,i),l=iLow(_Symbol,tf,i),pc=iClose(_Symbol,tf,i+1);
+      if(h<=0.0||l<=0.0||pc<=0.0) continue;
+      double tr=MathMax(h-l,MathMax(MathAbs(h-pc),MathAbs(l-pc)));
+      sum+=tr; n++;
+   }
+   return (n>0)?sum/(double)n:0.0;
+}
+
+double F16_Auth(int i){ return g_f16nodes[i].score + g_f16nodes[i].wt*4.0 + g_f16nodes[i].rev*3.0; }
+
+void F16_AddNode(double tip,double mid,int dir,double score,int wt){
+   int n=ArraySize(g_f16nodes); ArrayResize(g_f16nodes,n+1);
+   g_f16nodes[n].price=tip; g_f16nodes[n].mid=mid; g_f16nodes[n].dir=dir;
+   g_f16nodes[n].score=score; g_f16nodes[n].wt=wt; g_f16nodes[n].state=0;
+   g_f16nodes[n].bar=g_barCount; g_f16nodes[n].rev=0;
+   // cap (drop oldest)
+   while(ArraySize(g_f16nodes)>InpF16NodeMax){
+      for(int i=1;i<ArraySize(g_f16nodes);i++) g_f16nodes[i-1]=g_f16nodes[i];
+      ArrayResize(g_f16nodes,ArraySize(g_f16nodes)-1);
+   }
+}
+
+// f_fuPool port — dominant rejection wick at a local extreme (swept or not)
+void F16_FU(int ti,ENUM_TIMEFRAMES tf,int wt){
+   int s=1;
+   double o=iOpen(_Symbol,tf,s),h=iHigh(_Symbol,tf,s),l=iLow(_Symbol,tf,s),c=iClose(_Symbol,tf,s);
+   if(h<=0.0||l<=0.0) return;
+   double rng=MathMax(h-l,1e-10);
+   int lb=InpF16Lookback;
+   double pHi=iHigh(_Symbol,tf,iHighest(_Symbol,tf,MODE_HIGH,lb,s+1));
+   double pLo=iLow (_Symbol,tf,iLowest (_Symbol,tf,MODE_LOW, lb,s+1));
+   double uw=(h-MathMax(o,c))/rng, lw=(MathMin(o,c)-l)/rng;
+   bool localTop=(h>=iHigh(_Symbol,tf,iHighest(_Symbol,tf,MODE_HIGH,lb,s)));
+   bool localBot=(l<=iLow (_Symbol,tf,iLowest (_Symbol,tf,MODE_LOW, lb,s)));
+   bool bear=(uw>=InpF16WickFrac)&&((pHi>0.0&&h>=pHi&&c<pHi)||(localTop&&c<o));
+   bool bull=(lw>=InpF16WickFrac)&&((pLo>0.0&&l<=pLo&&c>pLo)||(localBot&&c>o));
+   double atr=F16_ATR(tf,14,s); if(atr<=0.0) atr=rng;
+   int    dir=0; double tip=0.0, mid=0.0, bH=MathMax(o,c), bL=MathMin(o,c);
+   if(bear){ dir=-1; tip=h; mid=bH+(tip-bH)*0.5;
+             g_f16fuDir[ti]=-1; g_f16fuBodyHi[ti]=bH; g_f16fuBodyLo[ti]=bL; g_f16fuConf[ti]=false; }
+   else if(bull){ dir=1; tip=l; mid=tip+(bL-tip)*0.5;
+             g_f16fuDir[ti]=1; g_f16fuBodyHi[ti]=bH; g_f16fuBodyLo[ti]=bL; g_f16fuConf[ti]=false; }
+   // confirmation latch (rejection followed through)
+   if(g_f16fuDir[ti]==-1 && !g_f16fuConf[ti] && c<g_f16fuBodyLo[ti]) g_f16fuConf[ti]=true;
+   if(g_f16fuDir[ti]== 1 && !g_f16fuConf[ti] && c>g_f16fuBodyHi[ti]) g_f16fuConf[ti]=true;
+   if(dir==0) return;                                  // no fresh FU on this bar
+   if(g_f16prevTip[ti]!=0.0 && MathAbs(tip-g_f16prevTip[ti])<1e-9) return; // dedupe same tip
+   g_f16prevTip[ti]=tip;
+   double wk=(dir==-1)?(tip-bH)/MathMax(atr,1e-10):(bL-tip)/MathMax(atr,1e-10);
+   double score=20.0+MathMin(25.0,wk*15.0)+(g_f16fuConf[ti]?30.0:0.0)+(wk>1.0?15.0:0.0)+(wk>1.5?10.0:0.0);
+   F16_AddNode(tip,mid,dir,score,wt);
+}
+
+void F16_ScanFU(){ for(int ti=0;ti<7;ti++) F16_FU(ti,g_f16tf[ti],g_f16wt[ti]); }
+
+// node lifecycle: consumed when price closes through it; else age -> dormant/historical;
+// reaction counter rises when price hovers near the level (memory of respect)
+void F16_UpdateNodes(){
+   double cl=gClose[1]; double natr=F16_ATR(_Period,14,1); if(natr<=0.0) natr=PipsToPrice(10.0);
+   for(int i=0;i<ArraySize(g_f16nodes);i++){
+      if(g_f16nodes[i].state==2) continue;
+      double np=g_f16nodes[i].price; int nd=g_f16nodes[i].dir;
+      int    age=g_barCount-g_f16nodes[i].bar;
+      bool consumed=(nd==-1)?(cl>np):(cl<np);
+      if(consumed){ g_f16nodes[i].state=2; continue; }
+      if(MathAbs(cl-np)<natr*0.25) g_f16nodes[i].rev++;
+      int wtn=g_f16nodes[i].wt;
+      g_f16nodes[i].state=(age>InpF16HistoryBars*wtn)?3:(age>InpF16DormantBars*wtn)?1:0;
+   }
+}
+
+// network scan: bias (MN-first), eligible count, directional authority, pressure,
+// the dominant forward attractor (TF-weight then authority), and the FEZ corridor
+void F16_NetworkScan(){
+   double cl=gClose[1];
+   g_f16netBias=0;
+   for(int ti=0;ti<7;ti++){ if(g_f16fuDir[ti]!=0){ g_f16netBias=g_f16fuDir[ti]; break; } }
+   if(g_f16netBias==0) g_f16netBias=(int)DominantBias();
+
+   g_f16eligN=0; double bullA=0.0, bearA=0.0;
+   double attrRank=-1.0; int attrIdx=-1;
+   double fezHiA=0.0, fezLoA=0.0; g_f16fezHi=0.0; g_f16fezLo=0.0;
+   for(int i=0;i<ArraySize(g_f16nodes);i++){
+      if(g_f16nodes[i].state==2) continue;
+      double a=F16_Auth(i);
+      if(a<InpF16AuthMin) continue;
+      double np=g_f16nodes[i].price; int nd=g_f16nodes[i].dir; int wt=g_f16nodes[i].wt;
+      g_f16eligN++;
+      if(nd==1) bullA+=a; else if(nd==-1) bearA+=a;
+      bool onBias=(g_f16netBias==-1)?(np<cl):(np>cl);
+      if(onBias){ double rk=wt*1000.0+a; if(rk>attrRank){ attrRank=rk; attrIdx=i; } }
+      if(np>cl && a>fezHiA){ g_f16fezHi=np; fezHiA=a; }
+      if(np<cl && a>fezLoA){ g_f16fezLo=np; fezLoA=a; }
+   }
+   if(attrIdx>=0){ g_f16attrPrice=g_f16nodes[attrIdx].price; g_f16attrScore=F16_Auth(attrIdx); g_f16attrWt=g_f16nodes[attrIdx].wt; }
+   else          { g_f16attrPrice=0.0; g_f16attrScore=0.0; g_f16attrWt=0; }
+   g_f16pressure=((bullA+bearA)>0.0)?(bullA-bearA)/(bullA+bearA)*100.0:0.0;
+   g_f16pdir=(g_f16pressure>12.0)?1:(g_f16pressure<-12.0)?-1:0;
+}
+
+// Time Intelligence Engine — cycle completion across MN/W/D/H4/H1
+void F16_Time(){
+   ENUM_TIMEFRAMES tf[5]={PERIOD_MN1,PERIOD_W1,PERIOD_D1,PERIOD_H4,PERIOD_H1};
+   double cl=gClose[1]; int bull=0,bear=0; bool h1Ht=false,h1Lt=false;
+   double h1O=0,h1H=0,h1L=0;
+   for(int i=0;i<5;i++){
+      double o=iOpen(_Symbol,tf[i],0), h=iHigh(_Symbol,tf[i],0), l=iLow(_Symbol,tf[i],0);
+      double ph=iHigh(_Symbol,tf[i],1), pl=iLow(_Symbol,tf[i],1);
+      if(o<=0.0) continue;
+      if(cl>o) bull++; else if(cl<o) bear++;
+      if(i==4){ h1O=o; h1H=h; h1L=l; h1Ht=(h>ph); h1Lt=(l<pl); }
+   }
+   g_f16timeDir=(bull>bear)?1:(bear>bull)?-1:0;
+   g_f16timeAlign=((bull+bear)>0)?MathMax(bull,bear)/(double)(bull+bear)*100.0:50.0;
+   g_f16timeConflict=100.0-g_f16timeAlign;
+   double pos=(h1H>h1L)?(cl-h1L)/MathMax(h1H-h1L,1e-9):0.5;
+   g_f16h1LowProb=(h1Lt&&!h1Ht)?30.0:(h1Ht&&!h1Lt)?70.0:MathRound(pos*100.0);
+   g_f16h1Timing=(h1Ht&&h1Lt)?"COMPLETION":(g_f16h1LowProb>=55.0)?"LOW FIRST":(g_f16h1LowProb<=45.0)?"HIGH FIRST":"BALANCED";
+   g_f16tSeq=(!h1Lt?"take H1 low":!h1Ht?"take H1 high":"H1 done");
+}
+
+// Opportunity synthesis — alignment / conflict / threat / confidence / grade
+// over the voters {network bias, MTF dominant bias, time dir, setup dir}
+void F16_Opportunity(){
+   int mtf=(int)DominantBias();
+   // bias strength = share of TFs agreeing with the dominant bias
+   int agree=0,tot=0;
+   for(int i=0;i<TF_COUNT;i++){ if(g_tfState[i].bias!=BIAS_NEUTRAL){ tot++; if((int)g_tfState[i].bias==mtf) agree++; } }
+   g_f16biasStrength=(tot>0)?agree/(double)tot*100.0:50.0;
+
+   int v1=g_f16netBias, v2=mtf, v3=g_f16timeDir, v4=g_setupDir;
+   int sum=v1+v2+v3+v4;
+   g_f16master=(sum>0)?1:(sum<0)?-1:0;
+   int cast=(v1!=0?1:0)+(v2!=0?1:0)+(v3!=0?1:0)+(v4!=0?1:0);
+   int forV=((v1==g_f16master&&v1!=0)?1:0)+((v2==g_f16master&&v2!=0)?1:0)
+           +((v3==g_f16master&&v3!=0)?1:0)+((v4==g_f16master&&v4!=0)?1:0);
+   g_f16alignment=(cast>0)?forV/(double)cast*100.0:50.0;
+   g_f16conflict =(cast>0)?(cast-forV)/(double)cast*100.0:0.0;
+   g_f16threat=MathMax(0.0,MathMin(100.0,g_f16conflict*0.45+g_f16timeConflict*0.20
+              +((g_f16pdir!=0&&g_f16pdir!=g_f16master)?18.0:0.0)));
+   double attrN=MathMin(g_f16attrScore,100.0);
+   g_f16confidence=MathMax(0.0,MathMin(100.0,g_f16alignment*0.40+g_f16timeAlign*0.12
+              +g_f16biasStrength*0.18+attrN*0.15+MathMin(15.0,g_f16eligN*1.2)-g_f16threat*0.20));
+   g_f16opp=MathMax(0.0,MathMin(100.0,g_f16alignment*0.40+attrN*0.30+g_f16biasStrength*0.30-g_f16threat*0.35));
+   g_f16oppGrade=(g_f16opp>=88.0)?"A+":(g_f16opp>=78.0)?"A":(g_f16opp>=65.0)?"B":(g_f16opp>=50.0)?"C":"NO-TRADE";
+
+   // flight-plan probability: the forward attractor's share of total forward authority
+   double fwdTot=0.0, fwdTop=0.0; double cl=gClose[1];
+   for(int i=0;i<ArraySize(g_f16nodes);i++){
+      if(g_f16nodes[i].state==2) continue; double a=F16_Auth(i); if(a<InpF16AuthMin) continue;
+      bool ahead=(g_f16master==-1)?(g_f16nodes[i].price<cl):(g_f16nodes[i].price>cl);
+      if(ahead){ fwdTot+=a; if(a>fwdTop) fwdTop=a; }
+   }
+   g_f16primProb=(fwdTot>0.0)?MathMin(92.0,40.0+fwdTop/fwdTot*52.0):(g_f16master!=0?60.0:50.0);
+
+   // size multiplier from confidence (context owns "how much")
+   double f=MathMax(0.0,MathMin(1.0,g_f16confidence/100.0));
+   g_f16sizeMult=InpF16OppSizeMin+(InpF16OppSizeMax-InpF16OppSizeMin)*f;
+}
+
+// full structural opposition (used only by the optional, off-by-default veto)
+bool F16_FullOpposition(int dir){
+   int mtf=(int)DominantBias();
+   return(g_f16netBias==-dir && mtf==-dir && g_f16timeDir==-dir);
+}
+
+void F16_Update(){
+   if(!InpF16Enable) return;
+   F16_ScanFU();
+   F16_UpdateNodes();
+   F16_NetworkScan();
+   F16_Time();
+   F16_Opportunity();
+}

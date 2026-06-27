@@ -78,13 +78,10 @@ input double InpChochBufferATR    = 0.75;   // CHoCH buffer (ATR)
 //==================================================================
 // 1C. INPUTS - LIFE / CURVE TREE
 //==================================================================
-input double InpLifeDeadExit      = 33.0;   // Life <= this (crossunder) closes that direction
-input double InpLifeReviveLevel   = 60.0;   // Life >= this = healthy hold (alert only)
-input bool   InpUseLifeEntryGate  = false;  // Only open new entries when life >= gate
-input double InpLifeMinEntry      = 45.0;   // Min life to allow new entries (if gate on)
+input double InpLifeDeadExit      = 33.0;   // EXIT: life <= this (crossunder) closes that direction
+input double InpLifeReviveLevel   = 60.0;   // life >= this = healthy hold (alert/dashboard only)
 input bool   InpShowDashboard     = true;   // Print Comment() dashboard
-// --- curve-tree entry gate + all-timeframe entries ---
-input double InpCurveConfirmLife  = 35.0;   // Curve tree must score >= this to allow new entries
+// --- curve-tree entry gate + all-timeframe entries (LIFE NOT USED FOR ENTRIES) ---
 input bool   InpRequireCurveOwner = true;   // Require curve-tree owner not opposed to the entry dir
 input bool   InpUsePhaseInNode    = true;   // Feed phase context into curve-tree node state
 input bool   InpTradeAllTF        = true;   // Fire P3/P4 from every timeframe curve (not just chart)
@@ -1635,23 +1632,20 @@ void ManageExits()
 //==================================================================
 // 19. TRADING EXECUTION - MULTI-CAMPAIGN, ALL-TIMEFRAME, CURVE-GATED
 //   P3/P4 fire from EVERY timeframe curve (per-TF structure engine).
-//   Each entry must pass the CURVE-TREE gate for its direction:
-//   the chart curve must score >= InpCurveConfirmLife and its owner
-//   node must not be opposed. Phases trigger; the curve tree confirms.
-//   No counter-direction block. Both books can run at once.
+//   Each entry must pass the CURVE-TREE gate: the curve tree's OWNER
+//   node must not be opposed to the entry direction. Phases trigger;
+//   the curve tree (ownership) confirms. LIFE IS NOT USED FOR ENTRIES
+//   — life only manages exits. No counter-direction block.
 //==================================================================
 bool CurveAllowsLong()
 {
-   if(gLong.m_life < InpCurveConfirmLife) return false;                 // tree too weak
-   if(InpRequireCurveOwner && gLong.m_ownDir == -1) return false;       // a bearish child owns the long tree
-   if(InpUseLifeEntryGate && gLong.m_life < InpLifeMinEntry) return false;
+   // ownership-only gate (no life): block longs only when a bearish curve owns the tree
+   if(InpRequireCurveOwner && gLong.m_ownDir == -1) return false;
    return true;
 }
 bool CurveAllowsShort()
 {
-   if(gShort.m_life < InpCurveConfirmLife) return false;
-   if(InpRequireCurveOwner && gShort.m_ownDir == 1) return false;       // a bullish child owns the short tree
-   if(InpUseLifeEntryGate && gShort.m_life < InpLifeMinEntry) return false;
+   if(InpRequireCurveOwner && gShort.m_ownDir == 1) return false;       // a bullish curve owns the short tree
    return true;
 }
 

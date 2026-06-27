@@ -257,6 +257,9 @@ input bool   InpF16GateGrade     = true; // veto: skip NO-TRADE opportunity grad
 input double InpF16ReversalBlk   = 60.0; // reversal/absorption belief >= this (and > continuation) blocks entry
 input double InpF16ThreatBlock   = 75.0; // threat >= this blocks entry
 input bool   InpF16MgmtObjExit   = true; // EXIT: BE + partial when the objective is reached & energy resolved
+input bool   InpF16FUConfirm     = true; // ENTRY: the F16 multi-TF network FU can confirm the Phase-2 FU step
+input bool   InpF16Confluence    = true; // ENTRY: require F16 confluence (network/belief not opposing, grade tradeable)
+input double InpF16FUNearATR     = 2.0;  // an F16 FU node must be within this many ATR of price to confirm an entry
 
 // --- node object (a remembered FU / flip level on some timeframe) ---
 struct F16Node {
@@ -315,6 +318,7 @@ double g_f16targetHeat=0.0; bool g_f16targetVacuum=false;
 double g_f16cycExhLong=0.0, g_f16cycExhShort=0.0;
 // decision resolver outputs (the single arbitration point)
 double g_f16decSize=1.0, g_f16decTarget=0.0; bool g_f16decVeto=false; string g_f16decReason="";
+bool   g_chkF16=true;   // F16 confluence checklist result (network/belief/grade agree with dir)
 
 //==================================================================
 // SERIES + BASIC HELPERS
@@ -756,16 +760,17 @@ void BuildChecklist(int dir){
    g_chk.s5_ofb1        = g_ofb1;
    g_chk.s5_ofb2        = g_ofb2;
    g_chk.s5_ofb3        = (!InpRequire3Shifts || g_ofb3);
-   g_chk.s6_fu          = (!InpRequireFU || g_fu);
+   g_chk.s6_fu          = (!InpRequireFU || g_fu || (InpF16FUConfirm && F16_FreshFU(dir)));
    g_chk.s7_timeOK      = (!InpEnforceDeadZone||!IsDeadZone()) && (!InpRequireSessionWindow||InSessionWindow()) && TLDConfirmed(dir);
    g_chk.s7_hardTP      = true;   // enforced at order time
    g_chk.s8_corr        = CorrelationOK(dir);
    g_chk.s8_news        = NewsClear();
+   g_chkF16             = F16_Confluent(dir);   // network/belief/grade must agree with the entry
 }
 bool ChecklistAllPass(){
    return g_chk.s1_cascade && g_chk.s2_phase3 && g_chk.s3_poi &&
           (!InpRequire3Shifts || (g_chk.s5_ofb1 && g_chk.s5_ofb2 && g_chk.s5_ofb3)) &&
-          g_chk.s6_fu && g_chk.s7_timeOK && g_chk.s8_corr && g_chk.s8_news;
+          g_chk.s6_fu && g_chk.s7_timeOK && g_chk.s8_corr && g_chk.s8_news && g_chkF16;
 }
 string FirstFailingStep(){
    if(!g_chk.s1_cascade) return "S1_cascade";
@@ -776,6 +781,7 @@ string FirstFailingStep(){
    if(!g_chk.s7_timeOK)  return "S7_time";
    if(!g_chk.s8_corr)    return "S8_corr";
    if(!g_chk.s8_news)    return "S8_news";
+   if(!g_chkF16)         return "S9_F16confluence";
    return "";
 }
 
@@ -1050,6 +1056,7 @@ void RunLifecycle(){
          // align with confirmed day type when available
          if(g_dayType==DCT_BULLISH && dir==-1) dir=0;
          if(g_dayType==DCT_BEARISH && dir==1) dir=0;
+         if(dir!=0 && InpF16Enable && InpF16VetoFullOpp && F16_FullOpposition(dir)) dir=0; // don't build a setup the whole stack opposes
          g_setupDir=dir;
          if(dir!=0){ IdentifyAndRefinePOI(dir);
             if(g_poi.isValid){ SetState(TS_POI_WATCH); } }
@@ -1062,7 +1069,7 @@ void RunLifecycle(){
          break;
       case TS_PRE_PHASE_2A:
          if(POIBlownThrough(dir)){ SetState(TS_INVALIDATED); }
-         else if(g_fu && g_ofb1){ SetState(TS_PHASE_2); }
+         else if((g_fu || (InpF16FUConfirm && F16_FreshFU(dir))) && g_ofb1){ SetState(TS_PHASE_2); }
          else if(g_barCount-g_stateBar>InpBOSLookback){ SetState(TS_INVALIDATED); }
          break;
       case TS_PHASE_2:
@@ -1525,4 +1532,32 @@ void F16_Decision(int dir){
    }
    if(InpF16GateGrade && (g_f16oppGrade=="NO-TRADE" || g_f16threat>=InpF16ThreatBlock)){
       g_f16decVeto=true; g_f16decReason="grade NO-TRADE / threat high"; return; }
+}
+
+
+
+// ── F16 ENTRY PARTICIPATION — the FU detector + node network help TAKE entries ──
+// A fresh, active, authoritative network FU node rejecting in the trade direction,
+// sitting near price = the multi-TF FU detector confirming the rejection. The spec
+// lifecycle can use this to satisfy the Phase-2 FU step (alongside the M2/M1 FU candle).
+bool F16_FreshFU(int dir){
+   if(!InpF16Enable) return false;
+   double cl=gClose[1]; double atr=F16_ATR(_Period,14,1); if(atr<=0.0) atr=PipsToPrice(10.0);
+   double near=atr*InpF16FUNearATR;
+   for(int i=0;i<ArraySize(g_f16nodes);i++){
+      if(g_f16nodes[i].state==2) continue;          // consumed
+      if(g_f16nodes[i].dir!=dir) continue;          // must reject in the trade direction
+      if(F16_Auth(i)<InpF16AuthMin) continue;       // must carry authority
+      if(MathAbs(g_f16nodes[i].price-cl)<=near) return true;
+   }
+   return false;
+}
+// The engine stack agrees with taking `dir`: network bias not opposed, belief not
+// opposed, opportunity grade tradeable. Lets the network CONFIRM (not just veto).
+bool F16_Confluent(int dir){
+   if(!InpF16Enable || !InpF16Confluence) return true;
+   if(g_f16netBias==-dir) return false;
+   if(g_f16beliefDir==-dir) return false;
+   if(g_f16oppGrade=="NO-TRADE") return false;
+   return true;
 }

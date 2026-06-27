@@ -99,6 +99,10 @@ input bool   InpMTFRequireRungAgree = true; // also require the entry TF's own s
 input double InpMTFBiasDeadband   = 3.0;    // |weighted bias| <= this = balanced (one top TF can't veto aligned lower TFs)
 input int    InpRotCount          = 2;      // ROTATION = lowest N timeframes agree (2 = M1+M5 lead the rotation)
 input bool   InpUseRotationExit   = true;   // EXIT: a lower-TF rotation against the open book flattens it
+// --- zone-based entries: buys at higher-TF demand, sells at higher-TF supply, when rotation confirmed ---
+input double InpZoneApproachATR   = 1.0;    // price must be within this many ATR of the higher-TF S/D zone to enter
+input double InpZoneSLBufferATR   = 0.5;    // stop placed this many ATR beyond the zone
+input bool   InpRequireCleanRotation = false; // require a clean (bottom-led) cascade before entering
 // --- direction memory + cross-timeframe phase confluence ---
 input int    InpMTFConfirmBars    = 3;      // a TF's direction must confirm this many bars before it flips (anti-whipsaw)
 input bool   InpRequirePhaseConfluence = true; // entries must be nested under agreeing phases across timeframes
@@ -1918,60 +1922,22 @@ bool CurveAllowsShort()
    return true;
 }
 
-void TryEnterLongTF(int idx, double riskCash)
+// Is price AT a higher-timeframe zone? dir=+1 -> a DEMAND (support) to BUY from;
+// dir=-1 -> a SUPPLY (resistance) to SELL from. Scans parent timeframes for the
+// nearest such zone within InpZoneApproachATR of price.
+bool AtHigherTFZone(int dir, double px, double atr, int &tfOut, double &zoneOut)
 {
-   if(!gTFEng[idx].Lactive) return;
-   int ph = gTFEng[idx].Lphase;
-   if(ph != 3 && ph != 4) return;
-   if(InpUseMTFDirection && InpMTFRequireRungAgree && g_mtfDir[idx] == -1) return; // this TF is bearish: no long
-   if(InpRequirePhaseConfluence)
+   tfOut = -1; zoneOut = 0.0;
+   int lo = (InpParentFromTFIndex < 0) ? 0 : (InpParentFromTFIndex > 7 ? 7 : InpParentFromTFIndex);
+   double bestD = 1e9;
+   for(int i = lo; i < 8; i++)
    {
-      if(PhaseConfluence(1) < InpMinPhaseConfluence) return;        // timeframes don't agree
-      if(idx < 7 && !HigherTFSupports(idx, 1)) return;              // not nested under a higher bullish phase
+      double z = (dir == 1) ? g_mtfDemand[i] : g_mtfSupply[i];
+      if(z <= 0.0) continue;
+      double d = MathAbs(px - z) / MathMax(atr, 1e-9);
+      if(d <= InpZoneApproachATR && d < bestD) { bestD = d; tfOut = i; zoneOut = z; }
    }
-   ENUM_TIMEFRAMES tf = g_mtfTF[idx];
-   datetime tfBar = iTime(_Symbol, tf, 0);
-   if(gTFEng[idx].LlastTrade == tfBar) return;     // one long add per TF bar
-   if(!CurveAllowsLong()) return;                  // CURVE-TREE GATE
-
-   double closeNow = Close[1];
-   double atr = TFATR(idx); if(atr <= 0.0) atr = GetATR(1);
-   if(ph == 4 && !(closeNow > gTFEng[idx].LanchorHigh)) return;  // breakout confirm
-   double entry = closeNow;
-   double sl    = gTFEng[idx].LanchorLow - atr * 0.25;
-   if(sl <= 0.0 || entry <= sl) return;
-   double lots = ComputeLots(riskCash, entry, sl);
-   lots = AdjustLotsForBasketCeiling(1, entry, sl, lots);
-   if(lots > 0.0 && SendMarketOrder(+1, lots, sl, "SYM P"+IntegerToString(ph)+" Long "+g_mtfLbl[idx]))
-   { gTFEng[idx].LlastTrade = tfBar; g_longLastEntryBar = g_barCount; }
-}
-
-void TryEnterShortTF(int idx, double riskCash)
-{
-   if(!gTFEng[idx].Sactive) return;
-   int ph = gTFEng[idx].Sphase;
-   if(ph != 3 && ph != 4) return;
-   if(InpUseMTFDirection && InpMTFRequireRungAgree && g_mtfDir[idx] == 1) return; // this TF is bullish: no short
-   if(InpRequirePhaseConfluence)
-   {
-      if(PhaseConfluence(-1) < InpMinPhaseConfluence) return;       // timeframes don't agree
-      if(idx < 7 && !HigherTFSupports(idx, -1)) return;             // not nested under a higher bearish phase
-   }
-   ENUM_TIMEFRAMES tf = g_mtfTF[idx];
-   datetime tfBar = iTime(_Symbol, tf, 0);
-   if(gTFEng[idx].SlastTrade == tfBar) return;
-   if(!CurveAllowsShort()) return;                 // CURVE-TREE GATE
-
-   double closeNow = Close[1];
-   double atr = TFATR(idx); if(atr <= 0.0) atr = GetATR(1);
-   if(ph == 4 && !(closeNow < gTFEng[idx].SanchorLow)) return;   // breakdown confirm
-   double entry = closeNow;
-   double sl    = gTFEng[idx].SanchorHigh + atr * 0.25;
-   if(sl <= 0.0 || entry >= sl) return;
-   double lots = ComputeLots(riskCash, entry, sl);
-   lots = AdjustLotsForBasketCeiling(-1, entry, sl, lots);
-   if(lots > 0.0 && SendMarketOrder(-1, lots, sl, "SYM P"+IntegerToString(ph)+" Short "+g_mtfLbl[idx]))
-   { gTFEng[idx].SlastTrade = tfBar; g_shortLastEntryBar = g_barCount; }
+   return (tfOut >= 0);
 }
 
 void ExecuteTrading()
@@ -1980,41 +1946,51 @@ void ExecuteTrading()
    if(!IsTradeTime()) return;
    double equity   = AccountInfoDouble(ACCOUNT_EQUITY);
    double riskCash = equity * InpRiskPercent * 0.01;
+   double close    = Close[1];
+   double atr      = GetATR(1); if(atr <= 0.0) atr = 1e-6;
 
-   // COUNTER-DIRECTION BLOCK: don't open longs while the short book is net
-   // profitable (and vice versa). A counter-trend bounce inside a running
-   // profitable campaign is noise, not a new campaign — opening against a
-   // profitable book bleeds net P&L. Toggle with InpBlockCounterProfit.
+   // ONLY trade a CONFIRMED rotation, and ONLY in the rotation's direction.
+   // (cascade bullish -> buys only; cascade bearish -> sells only.) This is why it
+   // can no longer sell into a confirmed bullish rotation.
+   int  cdir      = g_cascadeDir;
+   bool confirmed = (g_cascadeDepth >= InpRotCount) && (!InpRequireCleanRotation || g_cascadeClean);
+   if(cdir == 0 || !confirmed) return;
+
    bool blockLong  = InpBlockCounterProfit && (GetDirectionFloatingPnL(-1) > 0.0);
    bool blockShort = InpBlockCounterProfit && (GetDirectionFloatingPnL(1)  > 0.0);
 
-   // MTF DIRECTION authority: only trade WITH the map's net bias, BUT lower-timeframe
-   // rotation overrides it — when the execution TFs rotate one way they lead, so we
-   // don't trade against them (this stops selling into an M5/M15 rotation up).
-   int  mtfBias = MTFBias();
-   bool rotUp   = InpUseMTFDirection && LowerTFRotation(1);
-   bool rotDn   = InpUseMTFDirection && LowerTFRotation(-1);
-   if(rotUp) blockShort = true;                                  // lower TFs rotating up -> no shorts
-   if(rotDn) blockLong  = true;                                  // lower TFs rotating down -> no longs
-   if(InpUseMTFDirection && mtfBias == -1 && !rotUp) blockLong  = true;   // bearish bias -> no longs (unless rotating up)
-   if(InpUseMTFDirection && mtfBias ==  1 && !rotDn) blockShort = true;   // bullish bias -> no shorts (unless rotating down)
+   int tf = -1; double zone = 0.0;
 
-   if(!InpTradeAllTF)
+   // BUY: confirmed bullish rotation + price AT a higher-TF DEMAND zone
+   if(cdir == 1 && !blockLong && g_longLastEntryBar != g_barCount && CurveAllowsLong()
+      && AtHigherTFZone(1, close, atr, tf, zone)
+      && (!InpRequirePhaseConfluence || PhaseConfluence(1) >= InpMinPhaseConfluence))
    {
-      // single chart-matching rung only
-      int ci = -1;
-      for(int i = 0; i < 8; i++) if(g_mtfTF[i] == _Period) { ci = i; break; }
-      if(ci < 0) ci = 2;   // fallback to M15
-      if(!blockLong)  TryEnterLongTF(ci, riskCash);
-      if(!blockShort) TryEnterShortTF(ci, riskCash);
-      return;
+      double entry = close;
+      double sl    = zone - InpZoneSLBufferATR * atr;   // structural stop below the demand
+      if(sl > 0.0 && entry > sl)
+      {
+         double lots = ComputeLots(riskCash, entry, sl);
+         lots = AdjustLotsForBasketCeiling(1, entry, sl, lots);
+         if(lots > 0.0 && SendMarketOrder(+1, lots, sl, "SYM BUY "+g_mtfLbl[tf]+" demand"))
+            g_longLastEntryBar = g_barCount;
+      }
    }
 
-   int start = (InpEntryFromTFIndex < 0) ? 0 : (InpEntryFromTFIndex > 7 ? 7 : InpEntryFromTFIndex);
-   for(int i = start; i <= 7; i++)
+   // SELL: confirmed bearish rotation + price AT a higher-TF SUPPLY zone
+   if(cdir == -1 && !blockShort && g_shortLastEntryBar != g_barCount && CurveAllowsShort()
+      && AtHigherTFZone(-1, close, atr, tf, zone)
+      && (!InpRequirePhaseConfluence || PhaseConfluence(-1) >= InpMinPhaseConfluence))
    {
-      if(!blockLong)  TryEnterLongTF(i, riskCash);
-      if(!blockShort) TryEnterShortTF(i, riskCash);
+      double entry = close;
+      double sl    = zone + InpZoneSLBufferATR * atr;   // structural stop above the supply
+      if(sl > 0.0 && sl > entry)
+      {
+         double lots = ComputeLots(riskCash, entry, sl);
+         lots = AdjustLotsForBasketCeiling(-1, entry, sl, lots);
+         if(lots > 0.0 && SendMarketOrder(-1, lots, sl, "SYM SELL "+g_mtfLbl[tf]+" supply"))
+            g_shortLastEntryBar = g_barCount;
+      }
    }
 }
 

@@ -88,7 +88,7 @@ input bool   InpUseChainDecayExit = false;  // also exit on whole-chain decay (a
 input bool   InpUseParentExit     = true;   // life exit ONLY after expansion + at/approaching parent supply/demand
 input double InpExpandMinATR      = 2.0;    // owner curve must have travelled >= this (ATR) to count as "expanded"
 input double InpParentApproachATR = 2.0;    // within this many ATR of parent S/D = "approaching"
-input int    InpParentFromTFIndex = 3;      // lowest TF index treated as parent (0=M1 1=M5 2=M15 3=H1 4=H4 5=D1)
+input int    InpParentFromTFIndex = 4;      // lowest TF index treated as parent (0=M1 1=M5 2=M15 3=M30 4=H1 5=H4 6=D1 7=W1)
 input bool   InpShowDashboard     = true;   // Print Comment() dashboard
 // --- curve-tree entry gate + all-timeframe entries (LIFE NOT USED FOR ENTRIES) ---
 input bool   InpRequireCurveOwner = true;   // Require curve-tree owner not opposed to the entry dir
@@ -921,15 +921,17 @@ CCampaign gShort;
 //   reads on a fixed child->parent ladder. dir per TF = strict HH+HL
 //   (bull) / LH+LL (bear), origin->extreme coordinates retained.
 //==================================================================
-ENUM_TIMEFRAMES g_mtfTF[6]  = {PERIOD_M1, PERIOD_M5, PERIOD_M15, PERIOD_H1, PERIOD_H4, PERIOD_D1};
-string          g_mtfLbl[6] = {"M1","M5","M15","H1","H4","D1"};
-int             g_mtfDir[6];
-double          g_mtfOrigin[6];
-double          g_mtfExtreme[6];
-double          g_mtfSupply[6];   // per-TF supply (structural swing HIGH) — resistance
-double          g_mtfDemand[6];   // per-TF demand (structural swing LOW)  — support
-int             g_mtfPendDir[6];  // debounce: pending new direction per TF
-int             g_mtfPendCount[6];// debounce: consecutive confirmations of the pending direction
+ENUM_TIMEFRAMES g_mtfTF[8]  = {PERIOD_M1, PERIOD_M5, PERIOD_M15, PERIOD_M30, PERIOD_H1, PERIOD_H4, PERIOD_D1, PERIOD_W1};
+string          g_mtfLbl[8] = {"M1","M5","M15","M30","H1","H4","D1","W1"};
+int             g_mtfDir[8];
+double          g_mtfOrigin[8];
+double          g_mtfExtreme[8];
+double          g_mtfSupply[8];   // per-TF supply (structural swing HIGH) — resistance
+double          g_mtfDemand[8];   // per-TF demand (structural swing LOW)  — support
+int             g_mtfPendDir[8];  // debounce: pending new direction per TF
+int             g_mtfPendCount[8];// debounce: consecutive confirmations of the pending direction
+int             g_mtfRotBar[8];   // bar_index when this TF last ROTATED (changed direction)
+int             g_mtfPrevDir[8];  // previous committed direction (to detect a rotation event)
 
 bool IsPivotHighTF(ENUM_TIMEFRAMES tf, int c, int P)
 {
@@ -983,7 +985,7 @@ void TF_Read(ENUM_TIMEFRAMES tf, int &dir, double &origin, double &extreme)
 
 void UpdateMTFMap()
 {
-   for(int i = 0; i < 6; i++)
+   for(int i = 0; i < 8; i++)
    {
       int rawDir = 0; double o = 0.0, e = 0.0;
       TF_Read(g_mtfTF[i], rawDir, o, e);
@@ -996,7 +998,12 @@ void UpdateMTFMap()
          if(rawDir == g_mtfPendDir[i]) g_mtfPendCount[i]++;
          else { g_mtfPendDir[i] = rawDir; g_mtfPendCount[i] = 1; }
          if(g_mtfPendCount[i] >= InpMTFConfirmBars)
-         { g_mtfDir[i] = rawDir; g_mtfPendCount[i] = 0; g_mtfPendDir[i] = 0; }
+         {
+            g_mtfPrevDir[i] = g_mtfDir[i];
+            g_mtfDir[i]     = rawDir;
+            g_mtfRotBar[i]  = g_barCount;   // timestamp WHEN this timeframe rotated
+            g_mtfPendCount[i] = 0; g_mtfPendDir[i] = 0;
+         }
       }
       else { g_mtfPendCount[i] = 0; g_mtfPendDir[i] = 0; }
 
@@ -1015,7 +1022,7 @@ void UpdateMTFMap()
 int NearestZoneTF(double px, double atr, bool wantSupply, double &roomATR)
 {
    roomATR = 1e9; int best = -1;
-   for(int i = 0; i < 6; i++)
+   for(int i = 0; i < 8; i++)
    {
       double lvl = wantSupply ? g_mtfSupply[i] : g_mtfDemand[i];
       if(lvl <= 0.0) continue;
@@ -1029,14 +1036,14 @@ int MTF_Align(int campDir)
 {
    if(campDir == 0) return 0;
    int n = 0;
-   for(int i = 0; i < 6; i++) if(g_mtfDir[i] == campDir) n++;
+   for(int i = 0; i < 8; i++) if(g_mtfDir[i] == campDir) n++;
    return n;
 }
 
 string MTF_StoryLine()
 {
    string s = "";
-   for(int i = 0; i < 6; i++)
+   for(int i = 0; i < 8; i++)
    {
       string a = (g_mtfDir[i] == 1) ? "^" : (g_mtfDir[i] == -1) ? "v" : "-";
       s += g_mtfLbl[i] + a + " ";
@@ -1051,7 +1058,7 @@ string MTF_StoryLine()
 int OwnerTF(int dir)
 {
    int idx = -1;
-   for(int i = 0; i < 6; i++) if(g_mtfDir[i] == dir) idx = i;   // highest index matching dir
+   for(int i = 0; i < 8; i++) if(g_mtfDir[i] == dir) idx = i;   // highest index matching dir
    return idx;
 }
 // LONG destination: nearest SUPPLY above price at/above the bull owner (escalates up).
@@ -1060,7 +1067,7 @@ double DestinationSupply(double px, double atr, int &tfOut, double &roomATR)
    tfOut = -1; roomATR = 1e9; double best = 0.0;
    int owner = OwnerTF(1);
    int lo = (owner >= 0) ? owner : ((InpParentFromTFIndex < 0) ? 0 : InpParentFromTFIndex);
-   for(int i = lo; i < 6; i++)
+   for(int i = lo; i < 8; i++)
    {
       double v = g_mtfSupply[i];
       if(v > px && (best == 0.0 || v < best)) { best = v; tfOut = i; }
@@ -1074,7 +1081,7 @@ double DestinationDemand(double px, double atr, int &tfOut, double &roomATR)
    tfOut = -1; roomATR = 1e9; double best = 0.0;
    int owner = OwnerTF(-1);
    int lo = (owner >= 0) ? owner : ((InpParentFromTFIndex < 0) ? 0 : InpParentFromTFIndex);
-   for(int i = lo; i < 6; i++)
+   for(int i = lo; i < 8; i++)
    {
       double v = g_mtfDemand[i];
       if(v > 0.0 && v < px && v > best) { best = v; tfOut = i; }
@@ -1089,7 +1096,7 @@ double DestinationDemand(double px, double atr, int &tfOut, double &roomATR)
 double MTFBiasScore()
 {
    double sum = 0.0;
-   for(int i = 0; i < 6; i++) sum += (double)(i + 1) * (double)g_mtfDir[i];
+   for(int i = 0; i < 8; i++) sum += (double)(i + 1) * (double)g_mtfDir[i];
    return sum;   // range -21..+21
 }
 int MTFBias()
@@ -1098,15 +1105,41 @@ int MTFBias()
    if(MathAbs(sum) <= InpMTFBiasDeadband) return 0;   // balanced: one top TF can't veto aligned lower TFs
    return (sum > 0.0) ? 1 : -1;
 }
-// Lower-timeframe ROTATION: the lowest N timeframes (M1, M5, ...) all agree on a
-// direction. Lower timeframes LEAD — they rotate the higher timeframes — so when the
-// bottom of the stack turns, that direction is permitted and the opposite is blocked,
-// even against a higher-TF bias. This is the leading edge of a new move.
+// ===== ROTATION CASCADE ENGINE =====
+// Rotation propagates UP the ladder: M1 -> M5 -> M15 -> M30 -> H1 -> H4 -> D1 -> W1.
+// We track WHEN each timeframe rotated (g_mtfRotBar) and measure how far the current
+// rotation has climbed from the bottom (depth), whether it climbed in order (clean =
+// each higher TF turned at/after the lower one, i.e. the lower LED it), and which
+// timeframe it is now pressuring next.
+int  g_cascadeDir    = 0;
+int  g_cascadeDepth  = 0;
+bool g_cascadeClean  = false;
+int  g_cascadeNextTF = -1;
+
+void ComputeCascade()
+{
+   g_cascadeDir   = g_mtfDir[0];
+   g_cascadeDepth = 0;
+   g_cascadeClean = (g_cascadeDir != 0);
+   if(g_cascadeDir != 0)
+   {
+      g_cascadeDepth = 1;
+      for(int i = 1; i < 8; i++)
+      {
+         if(g_mtfDir[i] != g_cascadeDir) break;                        // contiguous block from M1 up
+         if(g_mtfRotBar[i] < g_mtfRotBar[i-1]) g_cascadeClean = false; // higher turned BEFORE lower -> not lower-led
+         g_cascadeDepth++;
+      }
+   }
+   g_cascadeNextTF = (g_cascadeDepth > 0 && g_cascadeDepth < 8) ? g_cascadeDepth : -1;
+}
+
+// Lower-timeframe ROTATION (cascade-based): the rotation has climbed at least
+// InpRotCount timeframes from the bottom in 'dir'. Lower timeframes LEAD, so this
+// direction is permitted and the opposite blocked, even against a higher-TF bias.
 bool LowerTFRotation(int dir)
 {
-   int n = InpRotCount; if(n < 1) n = 1; if(n > 6) n = 6;
-   for(int i = 0; i < n; i++) if(g_mtfDir[i] != dir) return false;
-   return true;
+   return (g_cascadeDir == dir && g_cascadeDepth >= InpRotCount);
 }
 
 // ===== CROSS-TIMEFRAME PHASE COMMUNICATION =====
@@ -1116,7 +1149,7 @@ bool LowerTFRotation(int dir)
 int PhaseConfluence(int dir)
 {
    int n = 0;
-   for(int i = 0; i < 6; i++)
+   for(int i = 0; i < 8; i++)
    {
       bool active = (dir == 1) ? gTFEng[i].Lactive : gTFEng[i].Sactive;
       int  ph     = (dir == 1) ? gTFEng[i].Lphase  : gTFEng[i].Sphase;
@@ -1128,7 +1161,7 @@ int PhaseConfluence(int dir)
 // (active & still building/retracing — phase 1..3 — or structurally aligned)?
 bool HigherTFSupports(int idx, int dir)
 {
-   for(int j = idx + 1; j < 6; j++)
+   for(int j = idx + 1; j < 8; j++)
    {
       bool active = (dir == 1) ? gTFEng[j].Lactive : gTFEng[j].Sactive;
       int  ph     = (dir == 1) ? gTFEng[j].Lphase  : gTFEng[j].Sphase;
@@ -1144,9 +1177,9 @@ bool HigherTFSupports(int idx, int dir)
 //   This is what lets P3/P4 trade off all curves, all timeframes.
 //   Each rung steps once per its own closed bar.
 //==================================================================
-int g_mtfATR[6];        // per-TF ATR handles
-int g_mtfPhaseL[6];     // per-TF long phase  (0 if inactive)
-int g_mtfPhaseS[6];     // per-TF short phase (0 if inactive)
+int g_mtfATR[8];        // per-TF ATR handles
+int g_mtfPhaseL[8];     // per-TF long phase  (0 if inactive)
+int g_mtfPhaseS[8];     // per-TF short phase (0 if inactive)
 
 struct TFEngine
 {
@@ -1163,7 +1196,7 @@ struct TFEngine
    int    Sphase, SprevPhase; bool SpreConv; double SinducPrice, SinducLow, SinducHigh; double ScycleLow;
    datetime SlastTrade;
 };
-TFEngine gTFEng[6];
+TFEngine gTFEng[8];
 
 double TFATR(int idx)
 {
@@ -1291,7 +1324,7 @@ void UpdateTFEngine(int idx)
 
 void UpdateMTFEngines()
 {
-   for(int i = 0; i < 6; i++)
+   for(int i = 0; i < 8; i++)
    {
       UpdateTFEngine(i);
       g_mtfPhaseL[i] = gTFEng[i].Lactive ? gTFEng[i].Lphase : 0;
@@ -1727,8 +1760,8 @@ void RunProfitLadder()
 double ParentSupplyAbove(double px, double atr, double &roomATR)
 {
    roomATR = 1e9; double best = 0.0;
-   int lo = (InpParentFromTFIndex < 0) ? 0 : (InpParentFromTFIndex > 5 ? 5 : InpParentFromTFIndex);
-   for(int i = lo; i < 6; i++)
+   int lo = (InpParentFromTFIndex < 0) ? 0 : (InpParentFromTFIndex > 7 ? 7 : InpParentFromTFIndex);
+   for(int i = lo; i < 8; i++)
    {
       double v = g_mtfSupply[i];
       if(v > px && (best == 0.0 || v < best)) best = v;   // nearest above
@@ -1740,8 +1773,8 @@ double ParentSupplyAbove(double px, double atr, double &roomATR)
 double ParentDemandBelow(double px, double atr, double &roomATR)
 {
    roomATR = 1e9; double best = 0.0;
-   int lo = (InpParentFromTFIndex < 0) ? 0 : (InpParentFromTFIndex > 5 ? 5 : InpParentFromTFIndex);
-   for(int i = lo; i < 6; i++)
+   int lo = (InpParentFromTFIndex < 0) ? 0 : (InpParentFromTFIndex > 7 ? 7 : InpParentFromTFIndex);
+   for(int i = lo; i < 8; i++)
    {
       double v = g_mtfDemand[i];
       if(v > 0.0 && v < px && v > best) best = v;   // nearest below
@@ -1884,7 +1917,7 @@ void TryEnterLongTF(int idx, double riskCash)
    if(InpRequirePhaseConfluence)
    {
       if(PhaseConfluence(1) < InpMinPhaseConfluence) return;        // timeframes don't agree
-      if(idx < 5 && !HigherTFSupports(idx, 1)) return;              // not nested under a higher bullish phase
+      if(idx < 7 && !HigherTFSupports(idx, 1)) return;              // not nested under a higher bullish phase
    }
    ENUM_TIMEFRAMES tf = g_mtfTF[idx];
    datetime tfBar = iTime(_Symbol, tf, 0);
@@ -1912,7 +1945,7 @@ void TryEnterShortTF(int idx, double riskCash)
    if(InpRequirePhaseConfluence)
    {
       if(PhaseConfluence(-1) < InpMinPhaseConfluence) return;       // timeframes don't agree
-      if(idx < 5 && !HigherTFSupports(idx, -1)) return;             // not nested under a higher bearish phase
+      if(idx < 7 && !HigherTFSupports(idx, -1)) return;             // not nested under a higher bearish phase
    }
    ENUM_TIMEFRAMES tf = g_mtfTF[idx];
    datetime tfBar = iTime(_Symbol, tf, 0);
@@ -1960,15 +1993,15 @@ void ExecuteTrading()
    {
       // single chart-matching rung only
       int ci = -1;
-      for(int i = 0; i < 6; i++) if(g_mtfTF[i] == _Period) { ci = i; break; }
+      for(int i = 0; i < 8; i++) if(g_mtfTF[i] == _Period) { ci = i; break; }
       if(ci < 0) ci = 2;   // fallback to M15
       if(!blockLong)  TryEnterLongTF(ci, riskCash);
       if(!blockShort) TryEnterShortTF(ci, riskCash);
       return;
    }
 
-   int start = (InpEntryFromTFIndex < 0) ? 0 : (InpEntryFromTFIndex > 5 ? 5 : InpEntryFromTFIndex);
-   for(int i = start; i <= 5; i++)
+   int start = (InpEntryFromTFIndex < 0) ? 0 : (InpEntryFromTFIndex > 7 ? 7 : InpEntryFromTFIndex);
+   for(int i = start; i <= 7; i++)
    {
       if(!blockLong)  TryEnterLongTF(i, riskCash);
       if(!blockShort) TryEnterShortTF(i, riskCash);
@@ -2098,8 +2131,20 @@ void UpdateDashboard()
       + (LowerTFRotation(1) ? "  ROT^ (no shorts)" : LowerTFRotation(-1) ? "  ROTv (no longs)" : "")
       + "  conf L" + IntegerToString(PhaseConfluence(1)) + "/S" + IntegerToString(PhaseConfluence(-1))
       + nl;
+   // rotation cascade: how far the rotation has climbed from the bottom + what it pressures next
+   string cblk = "";
+   for(int ci = 0; ci < g_cascadeDepth && ci < 8; ci++) cblk += g_mtfLbl[ci] + (ci < g_cascadeDepth-1 ? ">" : "");
+   s += "CASCADE: " + (g_cascadeDir==1?"^":g_cascadeDir==-1?"v":"-")
+      + " depth " + IntegerToString(g_cascadeDepth) + "/8 ["
+      + (cblk=="" ? "-" : cblk) + "] next "
+      + (g_cascadeNextTF>=0 ? g_mtfLbl[g_cascadeNextTF] : "full")
+      + (g_cascadeClean ? " clean" : " mixed") + nl;
+   string rage = "ROT age: ";
+   for(int ri = 0; ri < 8; ri++)
+      rage += g_mtfLbl[ri] + " " + (g_mtfRotBar[ri] > 0 ? IntegerToString(g_barCount - g_mtfRotBar[ri]) : "-") + "  ";
+   s += rage + nl;
    string tfp = "";
-   for(int i = 0; i < 6; i++)
+   for(int i = 0; i < 8; i++)
    {
       int pl = g_mtfPhaseL[i], ps = g_mtfPhaseS[i];
       string cell = g_mtfLbl[i] + ":";
@@ -2129,7 +2174,7 @@ void UpdateDashboard()
    // per-TF supply/demand distance in ATR (up = +, down = -) so the interaction is visible
    double pz = Close[1];
    string zs = "ZONES(ATR): ";
-   for(int zi = 0; zi < 6; zi++)
+   for(int zi = 0; zi < 8; zi++)
    {
       string su = (g_mtfSupply[zi] > 0.0) ? DoubleToString((g_mtfSupply[zi]-pz)/MathMax(dAtr,1e-9),1) : "-";
       string de = (g_mtfDemand[zi] > 0.0) ? DoubleToString((g_mtfDemand[zi]-pz)/MathMax(dAtr,1e-9),1) : "-";
@@ -2194,12 +2239,13 @@ int OnInit()
    gShort.Init(-1);
 
    // per-timeframe structure engines + ATR handles
-   for(int i = 0; i < 6; i++)
+   for(int i = 0; i < 8; i++)
    {
       g_mtfATR[i]    = iATR(_Symbol, g_mtfTF[i], InpATRLen);
       g_mtfDir[i]    = 0; g_mtfOrigin[i] = 0.0; g_mtfExtreme[i] = 0.0;
       g_mtfSupply[i] = 0.0; g_mtfDemand[i] = 0.0;
       g_mtfPendDir[i] = 0; g_mtfPendCount[i] = 0;
+      g_mtfRotBar[i] = 0; g_mtfPrevDir[i] = 0;
       g_mtfPhaseL[i] = 0; g_mtfPhaseS[i] = 0;
       ZeroMemory(gTFEng[i]);
       gTFEng[i].lastPivotDir = 0; gTFEng[i].prevPivotDir = 0;
@@ -2229,6 +2275,7 @@ void OnTick()
 
    // 3. multi-timeframe curve map (structural direction) + per-TF P3/P4 engines
    UpdateMTFMap();
+   ComputeCascade();
    UpdateMTFEngines();
 
    // 4. recursive curve trees + life + lineage + chain (per campaign)

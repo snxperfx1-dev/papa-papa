@@ -137,10 +137,10 @@ input int    InpCtxNewsH2      = 15;     // news window end hour
 input int    InpCtxNewsM2      = 30;
 //--- Phase 2 (A/B tier): extra engines. Restrictive gates default OFF. ---
 input double InpCtxFuWick       = 0.30;   // FU spike: min wick / range
-input bool   InpCtxAvoidManip   = false;  // GATE: block entries inside the 0.618-0.786 manipulation band
+input bool   InpCtxAvoidManip   = true;   // GATE: block entries inside the 0.618-0.786 manipulation band
 input int    InpCtxMinShifts     = 0;      // GATE: require N Wyckoff terminal shifts at the flip (0=off)
 input double InpCtxMinEntryProb  = 0.0;    // GATE: require entry-probability % (0=off)
-input bool   InpCtxMomFlip       = false;  // GATE: require M5 momentum into the trade direction
+input bool   InpCtxMomFlip       = true;   // GATE: require M5 momentum into the trade direction
 input bool   InpCtxFractalAgree  = false;  // GATE: require the fractal stack to agree with the trade
 input bool   InpCtxHuntMode      = false;  // OPP: Layer-2 continuation re-entries at demand/supply
 

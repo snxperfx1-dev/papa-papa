@@ -132,6 +132,7 @@ input bool   InpUseClassicEntry   = true;   // ENTRIES like original v1.6: gL/gS
 //     scores / sizes / targets / tags it, and hard-vetoes ONLY on full structural opposition ---
 input bool   InpCtxIntegrate      = true;   // CONTEXT: score, size and target each preserved v1.6 entry with the fractal model
 input bool   InpCtxVetoOpposition = true;   // hard-skip an entry ONLY when MTF bias + cascade + curve owner ALL oppose it (new-high-then-rotated rule)
+input bool   InpCtxVetoAtParent   = false;  // (off) also skip entries within InpParentApproachATR of the parent target. OFF so P4 breakouts (which fire AT resistance) are preserved.
 input double InpCtxMinConfidence  = 0.0;    // also skip entries below this context confidence (0 = never skip on score alone)
 input double InpCtxSizeMinMult    = 0.5;    // risk multiplier at 0 context confidence (weak-context entries trade smaller)
 input double InpCtxSizeMaxMult    = 1.4;    // risk multiplier at 100 context confidence (premium-context entries trade larger)
@@ -2386,10 +2387,11 @@ void PlanEntry(int dir, double px, double atr, EntryPlan &p)
    bool atZone = AtHigherTFZone(dir, px, atr, ztf, zp);
    p.zoneTF = ztf; p.zonePrice = zp;
 
-   // ---- ARBITRATION VETO — the ONLY place context blocks an entry ----
+   // ---- ARBITRATION VETO — the ONLY hard block is full structural opposition ----
+   bool atParentTgt = (e.regime == 1);
    if(InpCtxVetoOpposition && e.regime == 2)        // envelope CLOSED: whole structure rotated against us
    { p.veto = true; p.cls = 2; p.tag = "VETO-OPP"; }
-   else if(e.regime == 1)                           // price AT the parent target it's aiming for -> don't initiate
+   else if(InpCtxVetoAtParent && atParentTgt)       // OPTIONAL (off): price AT the parent target -> don't initiate
    { p.veto = true; p.cls = 2; p.tag = "VETO-ATPARENT"; }
 
    // ---- CLASSIFY + POLICY ----
@@ -2400,6 +2402,7 @@ void PlanEntry(int dir, double px, double atr, EntryPlan &p)
       if(atZone && (cas == dir) && ownerOK) { p.cls = 0; p.tag = "PRIM@" + g_mtfLbl[ztf]; }
       else if(aligned)                      { p.cls = 1; p.tag = "CONT"; }
       else                                  { p.cls = 2; p.tag = "SOLO"; }
+      if(atParentTgt) p.tag = p.tag + "@TGT";   // near the target: tagged, but NOT blocked or shrunk
 
       if(p.cls == 0)        // A PRIMARY: larger size, structural zone stop, run to parent via management
       { p.sizeMult = InpClassASize; p.useZoneStop = (InpCtxZoneStop && atZone); }

@@ -99,6 +99,10 @@ input bool   InpMTFRequireRungAgree = true; // also require the entry TF's own s
 input double InpMTFBiasDeadband   = 3.0;    // |weighted bias| <= this = balanced (one top TF can't veto aligned lower TFs)
 input int    InpRotTFa            = 1;      // rotation TF A index (default 1=M5)
 input int    InpRotTFb            = 2;      // rotation TF B index (default 2=M15)
+// --- direction memory + cross-timeframe phase confluence ---
+input int    InpMTFConfirmBars    = 3;      // a TF's direction must confirm this many bars before it flips (anti-whipsaw)
+input bool   InpRequirePhaseConfluence = true; // entries must be nested under agreeing phases across timeframes
+input int    InpMinPhaseConfluence = 2;     // min # of timeframes in the entry direction's phase/structure
 input bool   InpTradeAllTF        = true;   // Fire P3/P4 from every timeframe curve (not just chart)
 input int    InpEntryFromTFIndex  = 0;      // Lowest entry timeframe (0=M1 1=M5 2=M15 3=H1 4=H4 5=D1)
 
@@ -925,6 +929,8 @@ double          g_mtfOrigin[6];
 double          g_mtfExtreme[6];
 double          g_mtfSupply[6];   // per-TF supply (structural swing HIGH) — resistance
 double          g_mtfDemand[6];   // per-TF demand (structural swing LOW)  — support
+int             g_mtfPendDir[6];  // debounce: pending new direction per TF
+int             g_mtfPendCount[6];// debounce: consecutive confirmations of the pending direction
 
 bool IsPivotHighTF(ENUM_TIMEFRAMES tf, int c, int P)
 {
@@ -980,16 +986,29 @@ void UpdateMTFMap()
 {
    for(int i = 0; i < 6; i++)
    {
-      TF_Read(g_mtfTF[i], g_mtfDir[i], g_mtfOrigin[i], g_mtfExtreme[i]);
-      // each timeframe's own supply (swing high) and demand (swing low) zone,
-      // so the engine carries S/D coordinates for ALL timeframes at once and can
-      // reason about how the timeframes nest / interact.
-      if(g_mtfDir[i] != 0)
+      int rawDir = 0; double o = 0.0, e = 0.0;
+      TF_Read(g_mtfTF[i], rawDir, o, e);
+
+      // --- DIRECTION MEMORY / debounce: build a picture over time so the read does
+      //     not flip sell<->buy bar to bar. A flip only commits after the new
+      //     direction has held for InpMTFConfirmBars; a neutral read keeps the last. ---
+      if(rawDir != 0 && rawDir != g_mtfDir[i])
+      {
+         if(rawDir == g_mtfPendDir[i]) g_mtfPendCount[i]++;
+         else { g_mtfPendDir[i] = rawDir; g_mtfPendCount[i] = 1; }
+         if(g_mtfPendCount[i] >= InpMTFConfirmBars)
+         { g_mtfDir[i] = rawDir; g_mtfPendCount[i] = 0; g_mtfPendDir[i] = 0; }
+      }
+      else { g_mtfPendCount[i] = 0; g_mtfPendDir[i] = 0; }
+
+      // remember the last REAL structure coordinates (don't wipe them on a neutral read)
+      if(rawDir != 0) { g_mtfOrigin[i] = o; g_mtfExtreme[i] = e; }
+
+      if(g_mtfOrigin[i] != 0.0 && g_mtfExtreme[i] != 0.0)
       {
          g_mtfSupply[i] = MathMax(g_mtfOrigin[i], g_mtfExtreme[i]);
          g_mtfDemand[i] = MathMin(g_mtfOrigin[i], g_mtfExtreme[i]);
       }
-      else { g_mtfSupply[i] = 0.0; g_mtfDemand[i] = 0.0; }
    }
 }
 
@@ -1087,6 +1106,34 @@ bool LowerTFRotation(int dir)
    int a = InpRotTFa, b = InpRotTFb;
    if(a < 0 || a > 5 || b < 0 || b > 5) return false;
    return (g_mtfDir[a] == dir && g_mtfDir[b] == dir);
+}
+
+// ===== CROSS-TIMEFRAME PHASE COMMUNICATION =====
+// How many timeframes are telling the same story for 'dir' — an active campaign in
+// that direction (any phase) OR a structural bias in that direction. Used so an
+// entry only fires where the phases across timeframes AGREE (not a random single TF).
+int PhaseConfluence(int dir)
+{
+   int n = 0;
+   for(int i = 0; i < 6; i++)
+   {
+      bool active = (dir == 1) ? gTFEng[i].Lactive : gTFEng[i].Sactive;
+      int  ph     = (dir == 1) ? gTFEng[i].Lphase  : gTFEng[i].Sphase;
+      if((active && ph >= 1) || g_mtfDir[i] == dir) n++;
+   }
+   return n;
+}
+// Is the entry nested under a HIGHER timeframe that supports the direction
+// (active & still building/retracing — phase 1..3 — or structurally aligned)?
+bool HigherTFSupports(int idx, int dir)
+{
+   for(int j = idx + 1; j < 6; j++)
+   {
+      bool active = (dir == 1) ? gTFEng[j].Lactive : gTFEng[j].Sactive;
+      int  ph     = (dir == 1) ? gTFEng[j].Lphase  : gTFEng[j].Sphase;
+      if((active && ph >= 1 && ph <= 3) || g_mtfDir[j] == dir) return true;
+   }
+   return false;
 }
 
 //==================================================================
@@ -1833,6 +1880,11 @@ void TryEnterLongTF(int idx, double riskCash)
    int ph = gTFEng[idx].Lphase;
    if(ph != 3 && ph != 4) return;
    if(InpUseMTFDirection && InpMTFRequireRungAgree && g_mtfDir[idx] == -1) return; // this TF is bearish: no long
+   if(InpRequirePhaseConfluence)
+   {
+      if(PhaseConfluence(1) < InpMinPhaseConfluence) return;        // timeframes don't agree
+      if(idx < 5 && !HigherTFSupports(idx, 1)) return;              // not nested under a higher bullish phase
+   }
    ENUM_TIMEFRAMES tf = g_mtfTF[idx];
    datetime tfBar = iTime(_Symbol, tf, 0);
    if(gTFEng[idx].LlastTrade == tfBar) return;     // one long add per TF bar
@@ -1856,6 +1908,11 @@ void TryEnterShortTF(int idx, double riskCash)
    int ph = gTFEng[idx].Sphase;
    if(ph != 3 && ph != 4) return;
    if(InpUseMTFDirection && InpMTFRequireRungAgree && g_mtfDir[idx] == 1) return; // this TF is bullish: no short
+   if(InpRequirePhaseConfluence)
+   {
+      if(PhaseConfluence(-1) < InpMinPhaseConfluence) return;       // timeframes don't agree
+      if(idx < 5 && !HigherTFSupports(idx, -1)) return;             // not nested under a higher bearish phase
+   }
    ENUM_TIMEFRAMES tf = g_mtfTF[idx];
    datetime tfBar = iTime(_Symbol, tf, 0);
    if(gTFEng[idx].SlastTrade == tfBar) return;
@@ -2038,6 +2095,7 @@ void UpdateDashboard()
       + "  BIAS " + (dbias == 1 ? "^LONG-only" : dbias == -1 ? "vSHORT-only" : "-flat")
       + " (" + DoubleToString(MTFBiasScore(),0) + ")"
       + (LowerTFRotation(1) ? "  ROT^ (no shorts)" : LowerTFRotation(-1) ? "  ROTv (no longs)" : "")
+      + "  conf L" + IntegerToString(PhaseConfluence(1)) + "/S" + IntegerToString(PhaseConfluence(-1))
       + nl;
    string tfp = "";
    for(int i = 0; i < 6; i++)
@@ -2140,6 +2198,7 @@ int OnInit()
       g_mtfATR[i]    = iATR(_Symbol, g_mtfTF[i], InpATRLen);
       g_mtfDir[i]    = 0; g_mtfOrigin[i] = 0.0; g_mtfExtreme[i] = 0.0;
       g_mtfSupply[i] = 0.0; g_mtfDemand[i] = 0.0;
+      g_mtfPendDir[i] = 0; g_mtfPendCount[i] = 0;
       g_mtfPhaseL[i] = 0; g_mtfPhaseS[i] = 0;
       ZeroMemory(gTFEng[i]);
       gTFEng[i].lastPivotDir = 0; gTFEng[i].prevPivotDir = 0;

@@ -260,6 +260,8 @@ input bool   InpF16MgmtObjExit   = true; // EXIT: BE + partial when the objectiv
 input bool   InpF16FUConfirm     = true; // ENTRY: the F16 multi-TF network FU can confirm the Phase-2 FU step
 input bool   InpF16Confluence    = true; // ENTRY: require F16 confluence (network/belief not opposing, grade tradeable)
 input double InpF16FUNearATR     = 2.0;  // an F16 FU node must be within this many ATR of price to confirm an entry
+input bool   InpF16AnchorPOI     = true; // ENTRY STRUCTURE: snap the POI precision level to an aligned network FU node (the precise wick)
+input double InpF16AnchorTolATR  = 1.0;  // a network FU node within this many ATR of the POI zone qualifies as its precise anchor
 
 // --- node object (a remembered FU / flip level on some timeframe) ---
 struct F16Node {
@@ -319,6 +321,7 @@ double g_f16cycExhLong=0.0, g_f16cycExhShort=0.0;
 // decision resolver outputs (the single arbitration point)
 double g_f16decSize=1.0, g_f16decTarget=0.0; bool g_f16decVeto=false; string g_f16decReason="";
 bool   g_chkF16=true;   // F16 confluence checklist result (network/belief/grade agree with dir)
+bool   g_f16poiAnchored=false; int g_f16poiNodeWt=0; double g_f16poiNodePx=0.0; // POI precision anchored to a network FU node
 
 //==================================================================
 // SERIES + BASIC HELPERS
@@ -616,6 +619,9 @@ void IdentifyAndRefinePOI(int dir){
    g_poi.impulseHigh=impHi; g_poi.impulseLow=impLo;
    // top-down refinement
    int refIdx; double prec=RefineZone(dir,g_poi.priceLow,g_poi.priceHigh,refIdx);
+   // the network FU detector picks WHICH precise structure the entry is taken off:
+   // snap the precision level (entry/SL anchor) to an aligned, authoritative FU wick.
+   prec=F16_AnchorPrecision(dir,g_poi.priceLow,g_poi.priceHigh,prec);
    g_poi.precisionLevel=prec; g_poi.refinedTFidx=refIdx;
 
    // ---- 4 CRITERIA ----
@@ -640,9 +646,9 @@ void IdentifyAndRefinePOI(int dir){
    bool belowFlip=true; if(flip>0.0) belowFlip=(dir==1)?(prec<flip):(prec>flip);
    bool induce=IsInducement(dir,bid,impHi,impLo);
    g_poi.c3=(belowFlip && !induce);
-   // C4: refined to M5 or finer AND stop within ceiling
+   // C4: refined to M5 or finer (or anchored to an authoritative network FU) AND valid
    double stopPips=MathAbs(bid-prec)/MathMax(PipSize(),1e-9);
-   bool refinedEnough=(refIdx>=IDX_M5);
+   bool refinedEnough=(refIdx>=IDX_M5) || g_f16poiAnchored;
    g_poi.c4=(prec>0.0 && refinedEnough);
    g_poi.isValid=(g_poi.c1&&g_poi.c2&&g_poi.c3&&g_poi.c4);
 }
@@ -982,6 +988,7 @@ void AttemptEntry(int dir){
       Print("snX ENTRY ",(dir==1?"BUY":"SELL")," @",DoubleToString(entry,_Digits)," SL ",DoubleToString(sl,_Digits),
             " (",DoubleToString(stopPips,1),"p) lots ",DoubleToString(lots,2)," ",cmt," TP1 ",DoubleToString(tp1,_Digits),
             " refTF ",g_tfLbl[g_poi.refinedTFidx],
+            (g_f16poiAnchored?(" anchor "+F16_WtLabel(g_f16poiNodeWt)+" FU @ "+DoubleToString(g_f16poiNodePx,_Digits)):" anchor pivot"),
             "  | F16 opp ",g_f16oppGrade," conf ",DoubleToString(g_f16confidence,0),
             " sz x",DoubleToString(g_f16decSize,2)," belief ",(g_f16beliefDir==1?"+":g_f16beliefDir==-1?"-":"0"),
             " tgt ",(g_f16decTarget>0.0?DoubleToString(g_f16decTarget,_Digits):"-"));
@@ -1160,6 +1167,8 @@ void UpdateDashboard(){
         +"  heat "+DoubleToString(g_f16targetHeat,0)+(g_f16targetVacuum?" (vacuum)":"")+nl;
       s+="F16 CYCLE exhL "+DoubleToString(g_f16cycExhLong,0)+"%  exhS "+DoubleToString(g_f16cycExhShort,0)+"%"
         +"  H1 "+g_f16h1Timing+nl;
+      s+="F16 ANCHOR "+(g_f16poiAnchored?(F16_WtLabel(g_f16poiNodeWt)+" FU @ "+DoubleToString(g_f16poiNodePx,_Digits)+" (precise)"):"spec pivot")
+        +"  fresh-FU "+((g_setupDir!=0&&F16_FreshFU(g_setupDir))?"yes":"no")+nl;
    }
    Comment(s);
 }
@@ -1560,4 +1569,33 @@ bool F16_Confluent(int dir){
    if(g_f16beliefDir==-dir) return false;
    if(g_f16oppGrade=="NO-TRADE") return false;
    return true;
+}
+
+
+
+// ── F16 STRUCTURE ANCHOR — the FU detector picks WHICH precise structure the entry
+//    is taken off. If an authoritative network FU node (the precise wick) in `dir`
+//    sits in/near the refined POI zone, the entry's precision level (its SL/FU
+//    anchor) snaps to that FU node — so the entry is taken off the precise FU, not a
+//    looser pivot. Prefers the higher-timeframe, higher-authority FU. Returns the
+//    spec precision unchanged when no aligned FU node exists.
+string F16_WtLabel(int wt){ return wt==9?"MN":wt==8?"W1":wt==7?"D1":wt==6?"H4":wt==5?"H1":wt==4?"M15":wt==3?"M5":"?"; }
+double F16_AnchorPrecision(int dir,double zoneLo,double zoneHi,double curPrec){
+   g_f16poiAnchored=false; g_f16poiNodeWt=0; g_f16poiNodePx=0.0;
+   if(!InpF16Enable || !InpF16AnchorPOI) return curPrec;
+   double atr=F16_ATR(_Period,14,1); if(atr<=0.0) atr=PipsToPrice(10.0);
+   double tol=atr*InpF16AnchorTolATR;
+   double bestRank=-1.0, bestPx=0.0; int bestWt=0;
+   for(int i=0;i<ArraySize(g_f16nodes);i++){
+      if(g_f16nodes[i].state==2) continue;            // not consumed
+      if(g_f16nodes[i].dir!=dir) continue;            // bull FU anchors demand, bear FU anchors supply
+      double a=F16_Auth(i); if(a<InpF16AuthMin) continue;
+      double px=g_f16nodes[i].price;
+      if(px<zoneLo-tol || px>zoneHi+tol) continue;    // must align with this POI structure
+      double rank=g_f16nodes[i].wt*1000.0+a;          // prefer higher-TF, higher-authority FU
+      if(rank>bestRank){ bestRank=rank; bestPx=px; bestWt=g_f16nodes[i].wt; }
+   }
+   if(bestRank<0.0) return curPrec;                   // no aligned FU -> keep the spec precision
+   g_f16poiAnchored=true; g_f16poiNodeWt=bestWt; g_f16poiNodePx=bestPx;
+   return bestPx;                                     // entry taken off the precise FU wick
 }

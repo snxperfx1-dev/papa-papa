@@ -81,6 +81,8 @@ input double InpChochBufferATR    = 0.75;   // CHoCH buffer (ATR)
 input double InpLifeDeadExit      = 33.0;   // EXIT: life <= this (crossunder) closes that direction
 input double InpLifeReviveLevel   = 60.0;   // life >= this = healthy hold (alert/dashboard only)
 input bool   InpUseLifeExit       = true;   // EXIT: let the life score close positions
+input bool   InpManageOnlyAfterRotation = true; // profit-taking/management only after a new high/low is made AND price rotates
+input double InpManagePullbackATR = 1.0;    // pullback from the extreme (ATR) that counts as "rotating" -> management arms
 input double InpLifeArmLevel      = 55.0;   // life must first reach this (campaign got healthy) before a dead-cross can exit
 input int    InpLifeExitGraceBars = 12;     // no life/chain exit within N bars of the last entry (per direction)
 input bool   InpUseChainDecayExit = false;  // also exit on whole-chain decay (aggressive; off by default)
@@ -248,6 +250,16 @@ int      g_longLastEntryBar  = -100000;
 int      g_shortLastEntryBar = -100000;
 bool     g_longLifeArmed     = false;
 bool     g_shortLifeArmed    = false;
+
+// MATURITY gate: profit-taking/management only engages once the campaign has made a
+// new extreme AND begun rotating (price pulls back from the high/low). Before that the
+// position rides the expansion on its structural stop, un-choked.
+bool     g_longMatured  = false;
+bool     g_shortMatured = false;
+bool     g_longNewHigh  = false;
+bool     g_shortNewLow  = false;
+double   g_longCycHigh  = 0.0;
+double   g_shortCycLow  = 0.0;
 
 //==================================================================
 // 6. POSITION SORT STRUCT
@@ -1836,12 +1848,47 @@ void TrailStops(int direction)
    }
 }
 
+// MATURITY: a campaign "matures" once it has made a NEW HIGH (long) / NEW LOW (short)
+// AND price has begun ROTATING back from that extreme. Until then, management is held
+// off so the position can ride the expansion instead of being choked early.
+void UpdateMaturity()
+{
+   double atr = GetATR(1); if(atr <= 0.0) atr = 1e-6;
+   int lp = CountDirectionPositions(1), sp = CountDirectionPositions(-1);
+
+   if(lp == 0) { g_longMatured = false; g_longNewHigh = false; g_longCycHigh = 0.0; }
+   else
+   {
+      if(g_longCycHigh == 0.0) g_longCycHigh = High[1];
+      g_longCycHigh = MathMax(g_longCycHigh, High[1]);
+      if(NewHighMade()) g_longNewHigh = true;
+      bool rotating = (Close[1] < g_longCycHigh - InpManagePullbackATR * atr) || (g_mtfDir[0] == -1);
+      if(g_longNewHigh && rotating) g_longMatured = true;
+   }
+
+   if(sp == 0) { g_shortMatured = false; g_shortNewLow = false; g_shortCycLow = 0.0; }
+   else
+   {
+      if(g_shortCycLow == 0.0) g_shortCycLow = Low[1];
+      g_shortCycLow = MathMin(g_shortCycLow, Low[1]);
+      if(NewLowMade()) g_shortNewLow = true;
+      bool rotating = (Close[1] > g_shortCycLow + InpManagePullbackATR * atr) || (g_mtfDir[0] == 1);
+      if(g_shortNewLow && rotating) g_shortMatured = true;
+   }
+}
+// Is profit-taking/management allowed for this direction yet?
+bool ManageActive(int dir)
+{
+   if(!InpManageOnlyAfterRotation) return true;
+   return (dir == 1) ? g_longMatured : g_shortMatured;
+}
+
 void RunStopProtection()
 {
-   if(g_longBEActive  && !g_longTrailActive)  MoveStopsToBreakeven(1);
-   if(g_shortBEActive && !g_shortTrailActive) MoveStopsToBreakeven(-1);
-   if(g_longTrailActive)  TrailStops(1);
-   if(g_shortTrailActive) TrailStops(-1);
+   if(ManageActive(1)  && g_longBEActive  && !g_longTrailActive)  MoveStopsToBreakeven(1);
+   if(ManageActive(-1) && g_shortBEActive && !g_shortTrailActive) MoveStopsToBreakeven(-1);
+   if(ManageActive(1)  && g_longTrailActive)  TrailStops(1);
+   if(ManageActive(-1) && g_shortTrailActive) TrailStops(-1);
 }
 
 //==================================================================
@@ -1902,6 +1949,7 @@ void RunProfitLadderDirection(int direction, int &rungs)
       return;
    }
    if(totalRisk <= 0.0) return;
+   if(!ManageActive(direction)) return;   // hold off profit-taking until new-high/low + rotation
    double ratio  = totalPnL / totalRisk;
    string dirStr = (direction > 0) ? "LONG" : "SHORT";
    if(rungs == 0 && ratio >= InpLadderRung1)
@@ -1990,8 +2038,8 @@ void ManageExits()
    // a "ROT^ (no shorts)" state must also flatten existing shorts, not just stop new ones.
    if(InpUseRotationExit)
    {
-      if(shortPos > 0 && g_cascadeDir == 1  && g_cascadeDepth >= InpRotExitCount) { exitShort = true; reasonS = "ROT FLIP ^"; }
-      if(longPos  > 0 && g_cascadeDir == -1 && g_cascadeDepth >= InpRotExitCount) { exitLong  = true; reasonL = "ROT FLIP v"; }
+      if(shortPos > 0 && ManageActive(-1) && g_cascadeDir == 1  && g_cascadeDepth >= InpRotExitCount) { exitShort = true; reasonS = "ROT FLIP ^"; }
+      if(longPos  > 0 && ManageActive(1)  && g_cascadeDir == -1 && g_cascadeDepth >= InpRotExitCount) { exitLong  = true; reasonL = "ROT FLIP v"; }
    }
 
    // ---- arm-before-die: a campaign must first get HEALTHY before life can kill it,
@@ -2028,9 +2076,9 @@ void ManageExits()
    bool lifeWeakS = InpUseParentExit ? (gShort.LifeDeadCross() || gShort.m_life < InpLifeDeadExit) : gShort.LifeDeadCross();
 
    // ---------- LIFE-SCORE EXIT (armed + grace + expanded + at OWNER destination) ----------
-   if(InpUseLifeExit && longPos > 0 && g_longLifeArmed && longGraceOK && destLong && lifeWeakL)
+   if(InpUseLifeExit && longPos > 0 && ManageActive(1) && g_longLifeArmed && longGraceOK && destLong && lifeWeakL)
    { exitLong = true; reasonL = (InpUseParentExit ? ("LIFE@"+(destTFL>=0?g_mtfLbl[destTFL]:"DEST")) : "LIFE DEAD"); }
-   if(InpUseLifeExit && shortPos > 0 && g_shortLifeArmed && shortGraceOK && destShort && lifeWeakS)
+   if(InpUseLifeExit && shortPos > 0 && ManageActive(-1) && g_shortLifeArmed && shortGraceOK && destShort && lifeWeakS)
    { exitShort = true; reasonS = (InpUseParentExit ? ("LIFE@"+(destTFS>=0?g_mtfLbl[destTFS]:"DEST")) : "LIFE DEAD"); }
 
    // whole-chain collapse (optional, same gating)
@@ -2408,6 +2456,8 @@ void UpdateDashboard()
                      : "none (await major-zone reversal)") + nl;
    s += "HUNT: " + (g_huntMode==1?"BUY -> PARENT supply":g_huntMode==-1?"SELL -> PARENT demand":"-")
       + "  range [dem " + DoubleToString(g_flipDemand,2) + " / sup " + DoubleToString(g_flipSupply,2) + "]" + nl;
+   s += "MANAGE: L " + (CountDirectionPositions(1)==0?"flat":g_longMatured?"ARMED (high+rotation)":"held (riding)")
+      + "  | S " + (CountDirectionPositions(-1)==0?"flat":g_shortMatured?"ARMED (low+rotation)":"held (riding)") + nl;
    // fractal entry target: the rotated group reacts against this NEXT-up TF zone
    int pTF = g_cascadeDepth; if(pTF < 1) pTF = 1; if(pTF > 8) pTF = 8;
    double pzt = (g_cascadeDir==1) ? g_mtfDemand[pTF] : (g_cascadeDir==-1) ? g_mtfSupply[pTF] : 0.0;
@@ -2515,6 +2565,8 @@ int OnInit()
    gShort.Init(-1);
    g_prevCascadeDir = 0; g_sellContext = false; g_buyContext = false; g_sellCtxTF = -1; g_buyCtxTF = -1;
    g_huntMode = 0; g_flip = 0.0; g_flipSupply = 0.0; g_flipDemand = 0.0;
+   g_longMatured = false; g_shortMatured = false; g_longNewHigh = false; g_shortNewLow = false;
+   g_longCycHigh = 0.0; g_shortCycLow = 0.0;
 
    // per-timeframe structure engines + ATR handles
    for(int i = 0; i < 9; i++)
@@ -2566,6 +2618,7 @@ void OnTick()
    UpdateARC();
 
    // 6. stop protection + profit ladder
+   UpdateMaturity();
    RunStopProtection();
    RunProfitLadder();
 

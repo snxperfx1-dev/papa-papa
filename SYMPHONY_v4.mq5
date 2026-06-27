@@ -111,6 +111,9 @@ input bool   InpRequirePhaseTrigger = true; // require a P3/P4 phase (timing) in
 input int    InpZoneFromTFIndex   = 0;      // lowest TF whose S/D zone can be traded (0 = M1)
 input int    InpZoneOpenAhead     = 0;      // open zones this many TFs ABOVE the cascade front (0 = up to the just-rotated TF)
 input bool   InpRequireMajorZoneOrigin = false; // (optional) extra: also require the cascade FLIP to occur at a fixed major TF zone
+input bool   InpUseHuntCycle      = true;   // HUNT-MODE CYCLE: buy demand->flip TP->hunt sells->supply->flip TP->repeat
+input int    InpFlipTFIndex       = 5;      // controlling HTF for the flip zone (5 = H4; demand below / supply above)
+input double InpFlipBandATR       = 0.5;    // price within this many ATR of the flip = "reached" -> TP + auto-switch
 input int    InpMajorFromTFIndex  = 4;      // lowest TF treated as a MAJOR reversal zone (4 = H1)
 input double InpMajorZoneATR      = 3.0;    // the cascade flip must occur within this many ATR of the major zone
 // --- direction memory + cross-timeframe phase confluence ---
@@ -1168,6 +1171,13 @@ bool g_sellContext    = false;
 bool g_buyContext     = false;
 int  g_sellCtxTF      = -1;
 int  g_buyCtxTF       = -1;
+// ----- HUNT-MODE CYCLE -----  buy demand below flip -> TP at flip -> hunt sells above
+// flip -> TP at flip -> hunt buys below ... The HTF flip zone is the natural TP and the
+// auto-switch pivot. g_huntMode = +1 hunt BUYS (below flip), -1 hunt SELLS (above flip).
+int    g_huntMode    = 0;
+double g_flip        = 0.0;   // HTF flip level (TP + buy/sell divider)
+double g_flipSupply  = 0.0;   // controlling-HTF supply (above flip)
+double g_flipDemand  = 0.0;   // controlling-HTF demand (below flip)
 
 void ComputeCascade()
 {
@@ -1226,6 +1236,44 @@ void UpdateZoneContext()
       g_prevCascadeDir = g_cascadeDir;
    }
    // g_cascadeDir == 0 -> keep the existing context until a real flip
+}
+
+// ===== FLIP ZONE + HUNT-MODE CYCLE =====
+// The controlling HTF (InpFlipTFIndex) defines a flip level = midpoint of its
+// supply/demand. Demand sits below the flip, supply above. The flip is the natural
+// TP for BOTH directions and the auto-switch pivot of the hunt cycle.
+void ComputeFlip()
+{
+   int tf = (InpFlipTFIndex < 0) ? 0 : (InpFlipTFIndex > 8 ? 8 : InpFlipTFIndex);
+   double sup = g_mtfSupply[tf], dem = g_mtfDemand[tf];
+   if(sup > 0.0 && dem > 0.0 && sup > dem)
+   {
+      g_flipSupply = sup; g_flipDemand = dem;
+      g_flip = (sup + dem) * 0.5;
+   }
+}
+
+// Ride to the flip = take profit, then AUTO-SWITCH hunt direction. When flat, the
+// hunt mode aligns to which side of the flip price is on (below = hunt buys at demand,
+// above = hunt sells at supply).
+void UpdateHuntCycle()
+{
+   if(!InpUseHuntCycle || g_flip <= 0.0) return;
+   double px   = Close[1];
+   double band = InpFlipBandATR * GetATR(1);
+   int longPos  = CountDirectionPositions(1);
+   int shortPos = CountDirectionPositions(-1);
+
+   // long ran up into the flip -> TP and switch to hunting sells above the flip
+   if(g_huntMode == 1 && longPos > 0 && px >= g_flip - band)
+   { CloseDirection(1, "SYM TP FLIP long"); g_huntMode = -1; return; }
+   // short ran down into the flip -> TP and switch to hunting buys below the flip
+   if(g_huntMode == -1 && shortPos > 0 && px <= g_flip + band)
+   { CloseDirection(-1, "SYM TP FLIP short"); g_huntMode = 1; return; }
+
+   // flat: align the hunt to price's side of the flip
+   if(longPos == 0 && shortPos == 0)
+      g_huntMode = (px < g_flip) ? 1 : -1;
 }
 
 // Lower-timeframe ROTATION (cascade-based): the rotation has climbed at least
@@ -2123,6 +2171,8 @@ void LogEntry(int dir, int tf, double entry, double sl, double lots, double zone
    Print("   CURVE   : Llife ",DoubleToString(gLong.m_life,0)," ownDir ",IntegerToString(gLong.m_ownDir),
          " | Slife ",DoubleToString(gShort.m_life,0)," ownDir ",IntegerToString(gShort.m_ownDir),
          " | conf L",IntegerToString(PhaseConfluence(1)),"/S",IntegerToString(PhaseConfluence(-1)));
+   Print("   HUNT    : mode ",(g_huntMode==1?"BUY<flip":g_huntMode==-1?"SELL>flip":"-"),
+         "  flip ",DoubleToString(g_flip,2)," [dem ",DoubleToString(g_flipDemand,2)," / sup ",DoubleToString(g_flipSupply,2),"]");
 }
 
 void ExecuteTrading()
@@ -2148,6 +2198,7 @@ void ExecuteTrading()
 
    // BUY: confirmed bullish rotation + price AT a higher-TF DEMAND zone + P3/P4 timing
    if(cdir == 1 && !blockLong && g_longLastEntryBar != g_barCount && CurveAllowsLong()
+      && (!InpUseHuntCycle || g_flip <= 0.0 || (g_huntMode == 1 && close < g_flip))   // hunt BUYS below the flip
       && (!InpRequireMajorZoneOrigin || g_buyContext)
       && AtHigherTFZone(1, close, atr, tf, zone)
       && (!InpRequirePhaseTrigger || PhaseTrigger(1))
@@ -2168,6 +2219,7 @@ void ExecuteTrading()
 
    // SELL: confirmed bearish rotation + price AT a higher-TF SUPPLY zone + P3/P4 timing
    if(cdir == -1 && !blockShort && g_shortLastEntryBar != g_barCount && CurveAllowsShort()
+      && (!InpUseHuntCycle || g_flip <= 0.0 || (g_huntMode == -1 && close > g_flip))  // hunt SELLS above the flip
       && (!InpRequireMajorZoneOrigin || g_sellContext)
       && AtHigherTFZone(-1, close, atr, tf, zone)
       && (!InpRequirePhaseTrigger || PhaseTrigger(-1))
@@ -2321,6 +2373,8 @@ void UpdateDashboard()
    s += "CONTEXT: " + (g_buyContext ? ("BUY from "+(g_buyCtxTF>=0?g_mtfLbl[g_buyCtxTF]:"?")+" demand")
                      : g_sellContext ? ("SELL from "+(g_sellCtxTF>=0?g_mtfLbl[g_sellCtxTF]:"?")+" supply")
                      : "none (await major-zone reversal)") + nl;
+   s += "HUNT: " + (g_huntMode==1?"BUY (below flip)":g_huntMode==-1?"SELL (above flip)":"-")
+      + "  flip " + DoubleToString(g_flip,2) + " [dem " + DoubleToString(g_flipDemand,2) + " / sup " + DoubleToString(g_flipSupply,2) + "]" + nl;
    // fractal entry target: the rotated group reacts against this NEXT-up TF zone
    int pTF = g_cascadeDepth; if(pTF < 1) pTF = 1; if(pTF > 8) pTF = 8;
    double pzt = (g_cascadeDir==1) ? g_mtfDemand[pTF] : (g_cascadeDir==-1) ? g_mtfSupply[pTF] : 0.0;
@@ -2427,6 +2481,7 @@ int OnInit()
    gLong.Init(1);
    gShort.Init(-1);
    g_prevCascadeDir = 0; g_sellContext = false; g_buyContext = false; g_sellCtxTF = -1; g_buyCtxTF = -1;
+   g_huntMode = 0; g_flip = 0.0; g_flipSupply = 0.0; g_flipDemand = 0.0;
 
    // per-timeframe structure engines + ATR handles
    for(int i = 0; i < 9; i++)
@@ -2468,6 +2523,8 @@ void OnTick()
    UpdateMTFMap();
    ComputeCascade();
    UpdateZoneContext();
+   ComputeFlip();
+   UpdateHuntCycle();
 
    // 4. recursive curve trees + life + lineage + chain (per campaign)
    UpdateCampaigns();

@@ -94,6 +94,8 @@ input bool   InpShowDashboard     = true;   // Print Comment() dashboard
 input bool   InpRequireCurveOwner = true;   // Require curve-tree owner not opposed to the entry dir
 input bool   InpUsePhaseInNode    = true;   // Feed phase context into curve-tree node state
 input bool   InpBlockCounterProfit= true;   // Don't open one side while the OTHER book is net profitable
+input bool   InpUseMTFDirection   = true;   // DIRECTION: only trade with the MTF map's net bias
+input bool   InpMTFRequireRungAgree = true; // also require the entry TF's own structure to agree (not opposed)
 input bool   InpTradeAllTF        = true;   // Fire P3/P4 from every timeframe curve (not just chart)
 input int    InpEntryFromTFIndex  = 0;      // Lowest entry timeframe (0=M1 1=M5 2=M15 3=H1 4=H4 5=D1)
 
@@ -994,6 +996,22 @@ string MTF_StoryLine()
    return s;
 }
 
+// Net MTF DIRECTION authority: higher timeframes weigh more (owner = higher TF).
+// Returns +1 bullish bias, -1 bearish bias, 0 balanced. This is the direction the
+// algo is ALLOWED to trade — entries against it are blocked.
+int MTFBias()
+{
+   double sum = 0.0;
+   for(int i = 0; i < 6; i++) sum += (double)(i + 1) * (double)g_mtfDir[i]; // M1=1 .. D1=6
+   return (sum > 0.0) ? 1 : (sum < 0.0) ? -1 : 0;
+}
+double MTFBiasScore()
+{
+   double sum = 0.0;
+   for(int i = 0; i < 6; i++) sum += (double)(i + 1) * (double)g_mtfDir[i];
+   return sum;   // range -21..+21
+}
+
 //==================================================================
 // 11B. PER-TIMEFRAME STRUCTURE ENGINE  (P3/P4 on ALL curves)
 //   The same impulse -> phase 1-4 -> induc-zone machine the chart
@@ -1749,6 +1767,7 @@ void TryEnterLongTF(int idx, double riskCash)
    if(!gTFEng[idx].Lactive) return;
    int ph = gTFEng[idx].Lphase;
    if(ph != 3 && ph != 4) return;
+   if(InpUseMTFDirection && InpMTFRequireRungAgree && g_mtfDir[idx] == -1) return; // this TF is bearish: no long
    ENUM_TIMEFRAMES tf = g_mtfTF[idx];
    datetime tfBar = iTime(_Symbol, tf, 0);
    if(gTFEng[idx].LlastTrade == tfBar) return;     // one long add per TF bar
@@ -1771,6 +1790,7 @@ void TryEnterShortTF(int idx, double riskCash)
    if(!gTFEng[idx].Sactive) return;
    int ph = gTFEng[idx].Sphase;
    if(ph != 3 && ph != 4) return;
+   if(InpUseMTFDirection && InpMTFRequireRungAgree && g_mtfDir[idx] == 1) return; // this TF is bullish: no short
    ENUM_TIMEFRAMES tf = g_mtfTF[idx];
    datetime tfBar = iTime(_Symbol, tf, 0);
    if(gTFEng[idx].SlastTrade == tfBar) return;
@@ -1801,6 +1821,11 @@ void ExecuteTrading()
    // profitable book bleeds net P&L. Toggle with InpBlockCounterProfit.
    bool blockLong  = InpBlockCounterProfit && (GetDirectionFloatingPnL(-1) > 0.0);
    bool blockShort = InpBlockCounterProfit && (GetDirectionFloatingPnL(1)  > 0.0);
+
+   // MTF DIRECTION authority: only trade WITH the map's net bias.
+   int mtfBias = MTFBias();
+   if(InpUseMTFDirection && mtfBias == -1) blockLong  = true;   // map bearish -> no longs
+   if(InpUseMTFDirection && mtfBias ==  1) blockShort = true;   // map bullish -> no shorts
 
    if(!InpTradeAllTF)
    {
@@ -1937,7 +1962,10 @@ void UpdateDashboard()
       + "  -> " + AliveVerdict(gShort, -1) + nl;
 
    s += "------------------------------------------" + nl;
-   s += "MTF MAP:  " + MTF_StoryLine() + nl;
+   int dbias = MTFBias();
+   s += "MTF MAP:  " + MTF_StoryLine()
+      + "  BIAS " + (dbias == 1 ? "^LONG-only" : dbias == -1 ? "vSHORT-only" : "-flat")
+      + " (" + DoubleToString(MTFBiasScore(),0) + ")" + nl;
    string tfp = "";
    for(int i = 0; i < 6; i++)
    {

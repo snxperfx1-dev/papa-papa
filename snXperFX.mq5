@@ -249,7 +249,14 @@ input bool   InpF16NetTarget   = true;   // use the nearest forward node as the 
 input bool   InpF16SizeByOpp   = true;   // scale risk% by the opportunity grade
 input double InpF16OppSizeMin  = 0.6;    // risk multiplier at 0 opportunity
 input double InpF16OppSizeMax  = 1.3;    // risk multiplier at 100 opportunity
-input bool   InpF16VetoFullOpp = false;  // (off) skip an entry ONLY when network+MTF+time ALL oppose it
+input bool   InpF16VetoFullOpp = true;   // veto: skip when network+MTF+time ALL oppose the direction
+input bool   InpF16GateReversal  = true; // veto: skip when reversal/absorption BELIEF dominates against dir
+input bool   InpF16GateObjective = true; // veto: don't chase a move whose objective/energy is already resolved
+input bool   InpF16GateCycle     = true; // veto: skip when the HTF time-cycle is exhausted against dir
+input bool   InpF16GateGrade     = true; // veto: skip NO-TRADE opportunity grade / extreme threat
+input double InpF16ReversalBlk   = 60.0; // reversal/absorption belief >= this (and > continuation) blocks entry
+input double InpF16ThreatBlock   = 75.0; // threat >= this blocks entry
+input bool   InpF16MgmtObjExit   = true; // EXIT: BE + partial when the objective is reached & energy resolved
 
 // --- node object (a remembered FU / flip level on some timeframe) ---
 struct F16Node {
@@ -289,6 +296,25 @@ double g_f16alignment = 50.0, g_f16conflict = 0.0, g_f16confidence = 50.0;
 double g_f16threat = 0.0, g_f16opp = 0.0, g_f16biasStrength = 50.0;
 string g_f16oppGrade = "-"; int g_f16master = 0; double g_f16primProb = 50.0;
 double g_f16sizeMult = 1.0;
+
+// physics-lite (chart TF, closed bars) + observation scores
+double g_f16eff=0.0,g_f16disp=0.0,g_f16vel=0.0,g_f16acc=0.0,g_f16conv=0.0,g_f16comp=0.0;
+double g_f16obsExp=0.0,g_f16obsDecay=0.0,g_f16obsCurv=0.0,g_f16obsAbs=0.0,g_f16obsLiq=0.0;
+bool   g_f16impBull=false,g_f16impBear=false;
+// belief probabilities (EMA-smoothed 0..100) + net belief direction
+double g_f16bExp=0.0,g_f16bCont=0.0,g_f16bCreate=0.0,g_f16bAbsorb=0.0,g_f16bRetr=0.0,g_f16bReturn=0.0;
+int    g_f16beliefDir=0;
+// energy / resolution / attractor (EDE/RE/EAE-lite)
+double g_f16expEnergy=0.0,g_f16dissEnergy=0.0,g_f16residual=0.0,g_f16eaePrice=0.0;
+int    g_f16resCode=0;
+// liquidation-wave objective arrival
+bool   g_f16objArrival=false; double g_f16objDistPct=100.0;
+// liquidity heat around the target (reuses the spec liquidity pools)
+double g_f16targetHeat=0.0; bool g_f16targetVacuum=false;
+// HTF time-cycle exhaustion (0..100) against buying / selling
+double g_f16cycExhLong=0.0, g_f16cycExhShort=0.0;
+// decision resolver outputs (the single arbitration point)
+double g_f16decSize=1.0, g_f16decTarget=0.0; bool g_f16decVeto=false; string g_f16decReason="";
 
 //==================================================================
 // SERIES + BASIC HELPERS
@@ -896,8 +922,13 @@ void AttemptEntry(int dir){
    if(CountPositions()>=InpMaxPositions) return;
    if(!ChecklistAllPass()) return;
    if(IsDeadZone()) return;
-   // F16 arbitration (optional, OFF by default): skip ONLY when network+MTF+time ALL oppose.
-   if(InpF16Enable && InpF16VetoFullOpp && F16_FullOpposition(dir)) return;
+   // F16 DECISION — every engine feeds ONE arbitration point: size · target · take/skip.
+   // It never alters the entry trigger or the SL geometry; it only decides whether this
+   // spec-triggered entry is taken, how big, and which runner target it aims at.
+   if(InpF16Enable){
+      F16_Decision(dir);
+      if(g_f16decVeto){ Print("snX F16 VETO ",(dir==1?"BUY":"SELL")," — ",g_f16decReason); return; }
+   }
 
    double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK),bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
    double entry=(dir==1)?ask:bid; double prec=g_poi.precisionLevel;
@@ -912,19 +943,20 @@ void AttemptEntry(int dir){
    if(counter){ et=ENTRY_INDUCEMENT; riskPct=MathMin(riskPct,InpCounterRiskPct); }
    else if(stopPips>InpGoldStopMax){ et=ENTRY_AGGRESSIVE; riskPct*=InpAggrSizeMult; }
    if(g_reduceSizing) riskPct*=0.5;
-   // F16 context owns "how much": scale risk by the opportunity grade (entry trigger & SL unchanged)
-   if(InpF16Enable && InpF16SizeByOpp) riskPct=MathMax(0.05, riskPct*g_f16sizeMult);
+   // F16 context owns "how much": scale risk by the resolved decision size (entry & SL unchanged)
+   if(InpF16Enable && InpF16SizeByOpp) riskPct=MathMax(0.05, riskPct*g_f16decSize);
 
    // TPs
    ENUM_TIMEFRAMES etf=g_tf[IDX_H4]; Swing sw[]; CollectSwingsTF(etf,sw,10);
    int t1=SwingRank(sw,(dir==1)?1:-1,0);
    double tp1=(t1>=0)?sw[t1].price:(dir==1?entry+PipsToPrice(InpHardTPPips):entry-PipsToPrice(InpHardTPPips));
    double tp2=(dir==1)?g_tfState[IDX_H4].externalHigh:g_tfState[IDX_H4].externalLow; if(tp2<=0.0)tp2=tp1;
-   // F16 context owns "which target": extend the runner to the dominant forward network node when it sits farther
-   if(InpF16Enable && InpF16NetTarget && g_f16attrPrice>0.0){
-      bool ahead =(dir==1)?(g_f16attrPrice>entry):(g_f16attrPrice<entry);
-      bool farther=(dir==1)?(g_f16attrPrice>tp2)  :(g_f16attrPrice<tp2);
-      if(ahead && farther) tp2=g_f16attrPrice;
+   // F16 context owns "which target": extend the runner to the resolved decision target
+   // (network attractor / energy magnet) when it sits farther than the structural TP2
+   if(InpF16Enable && InpF16NetTarget && g_f16decTarget>0.0){
+      bool ahead =(dir==1)?(g_f16decTarget>entry):(g_f16decTarget<entry);
+      bool farther=(dir==1)?(g_f16decTarget>tp2)  :(g_f16decTarget<tp2);
+      if(ahead && farther) tp2=g_f16decTarget;
    }
    double hardTP=0.0;
    if(et==ENTRY_INDUCEMENT) hardTP=(dir==1)?entry+PipsToPrice(InpInducementTPPips):entry-PipsToPrice(InpInducementTPPips);
@@ -945,7 +977,8 @@ void AttemptEntry(int dir){
             " (",DoubleToString(stopPips,1),"p) lots ",DoubleToString(lots,2)," ",cmt," TP1 ",DoubleToString(tp1,_Digits),
             " refTF ",g_tfLbl[g_poi.refinedTFidx],
             "  | F16 opp ",g_f16oppGrade," conf ",DoubleToString(g_f16confidence,0),
-            " sz x",DoubleToString(g_f16sizeMult,2)," attr ",(g_f16attrPrice>0.0?DoubleToString(g_f16attrPrice,_Digits):"-"));
+            " sz x",DoubleToString(g_f16decSize,2)," belief ",(g_f16beliefDir==1?"+":g_f16beliefDir==-1?"-":"0"),
+            " tgt ",(g_f16decTarget>0.0?DoubleToString(g_f16decTarget,_Digits):"-"));
    }
 }
 
@@ -963,6 +996,16 @@ void ManagePositions(){
       if((dir==1&&dom==BIAS_BEARISH)||(dir==-1&&dom==BIAS_BULLISH)){ ClosePositionFull(tk,"snX FE HTF"); continue; }
       // near close: ensure hard TP
       if(IsNearClose() && curTP<=0.0 && g_trades[i].hardTP>0.0) ModifySLTP(tk,curSL,g_trades[i].hardTP);
+      // F16 EXIT — objective reached / energy resolved in this direction: bank a partial + lock BE.
+      // (Energy/attractor + liquidation-wave engines drive exits only, per the life-affects-exits rule.)
+      if(InpF16Enable && InpF16MgmtObjExit && (g_f16objArrival || g_f16resCode==2)){
+         bool inProfit=(dir==1)?(px>entry):(px<entry);
+         bool objAhead=(g_f16eaePrice>0.0)&&((dir==1)?(g_f16eaePrice>=entry):(g_f16eaePrice<=entry));
+         if(inProfit && objAhead){
+            if(!g_trades[i].partialDone){ ClosePartial(tk,lots*InpTP1Partial,"snX F16 OBJ"); g_trades[i].partialDone=true; }
+            if(!g_trades[i].beDone){ ModifySLTP(tk,entry,curTP); g_trades[i].beDone=true; }
+         }
+      }
       // TP1 partial + BE
       if(!g_trades[i].partialDone){
          bool hit=(dir==1)?(px>=g_trades[i].tp1):(px<=g_trades[i].tp1);
@@ -1101,6 +1144,15 @@ void UpdateDashboard(){
       s+="F16 OPP "+g_f16oppGrade+" "+DoubleToString(g_f16opp,0)+"/100"
         +"  conf "+DoubleToString(g_f16confidence,0)+"  threat "+DoubleToString(g_f16threat,0)
         +"  size x"+DoubleToString(g_f16sizeMult,2)+"  path "+DoubleToString(g_f16primProb,0)+"%"+nl;
+      s+="F16 BELIEF "+(g_f16beliefDir==1?"^":g_f16beliefDir==-1?"v":"-")
+        +"  cont "+DoubleToString(g_f16bCont,0)+"  retr "+DoubleToString(g_f16bRetr,0)
+        +"  absorb "+DoubleToString(g_f16bAbsorb,0)+"  exp "+DoubleToString(g_f16bExp,0)+nl;
+      s+="F16 ENERGY res "+DoubleToString(g_f16residual,0)+"%  "
+        +(g_f16resCode==2?"RESOLVED":g_f16resCode==1?"PARTIAL":"UNRESOLVED")
+        +"  obj "+(g_f16objArrival?"ARRIVED":DoubleToString(g_f16objDistPct,0)+"%")
+        +"  heat "+DoubleToString(g_f16targetHeat,0)+(g_f16targetVacuum?" (vacuum)":"")+nl;
+      s+="F16 CYCLE exhL "+DoubleToString(g_f16cycExhLong,0)+"%  exhS "+DoubleToString(g_f16cycExhShort,0)+"%"
+        +"  H1 "+g_f16h1Timing+nl;
    }
    Comment(s);
 }
@@ -1261,17 +1313,19 @@ void F16_NetworkScan(){
    g_f16pdir=(g_f16pressure>12.0)?1:(g_f16pressure<-12.0)?-1:0;
 }
 
-// Time Intelligence Engine — cycle completion across MN/W/D/H4/H1
+// Time Intelligence Engine — cycle completion across MN/W/D/H4/H1 + HTF cycle exhaustion
 void F16_Time(){
    ENUM_TIMEFRAMES tf[5]={PERIOD_MN1,PERIOD_W1,PERIOD_D1,PERIOD_H4,PERIOD_H1};
    double cl=gClose[1]; int bull=0,bear=0; bool h1Ht=false,h1Lt=false;
-   double h1O=0,h1H=0,h1L=0;
+   double h1H=0,h1L=0; int hiTaken=0,loTaken=0;
    for(int i=0;i<5;i++){
       double o=iOpen(_Symbol,tf[i],0), h=iHigh(_Symbol,tf[i],0), l=iLow(_Symbol,tf[i],0);
       double ph=iHigh(_Symbol,tf[i],1), pl=iLow(_Symbol,tf[i],1);
       if(o<=0.0) continue;
       if(cl>o) bull++; else if(cl<o) bear++;
-      if(i==4){ h1O=o; h1H=h; h1L=l; h1Ht=(h>ph); h1Lt=(l<pl); }
+      bool ht=(h>ph), lt=(l<pl);
+      if(i>=2){ if(ht)hiTaken++; if(lt)loTaken++; }   // D, H4, H1 cycles
+      if(i==4){ h1H=h; h1L=l; h1Ht=ht; h1Lt=lt; }
    }
    g_f16timeDir=(bull>bear)?1:(bear>bull)?-1:0;
    g_f16timeAlign=((bull+bear)>0)?MathMax(bull,bear)/(double)(bull+bear)*100.0:50.0;
@@ -1280,6 +1334,9 @@ void F16_Time(){
    g_f16h1LowProb=(h1Lt&&!h1Ht)?30.0:(h1Ht&&!h1Lt)?70.0:MathRound(pos*100.0);
    g_f16h1Timing=(h1Ht&&h1Lt)?"COMPLETION":(g_f16h1LowProb>=55.0)?"LOW FIRST":(g_f16h1LowProb<=45.0)?"HIGH FIRST":"BALANCED";
    g_f16tSeq=(!h1Lt?"take H1 low":!h1Ht?"take H1 high":"H1 done");
+   // upside liquidity already taken across D/H4/H1 -> the cycle is exhausted for NEW longs (mirror for shorts)
+   g_f16cycExhLong =hiTaken/3.0*100.0;
+   g_f16cycExhShort=loTaken/3.0*100.0;
 }
 
 // Opportunity synthesis — alignment / conflict / threat / confidence / grade
@@ -1333,5 +1390,139 @@ void F16_Update(){
    F16_UpdateNodes();
    F16_NetworkScan();
    F16_Time();
+   F16_Physics();
+   F16_Belief();
+   F16_Energy();
+   F16_TargetHeat();
    F16_Opportunity();
+}
+
+
+
+//==================================================================
+// F16 DEEP ENGINES — physics · belief · energy/attractor · liq-wave
+//   Each one does the SPECIFIC job it was designed for and feeds the
+//   single decision resolver below. Reads OHLC + the spec liquidity
+//   pools only; never sends or modifies an order itself.
+//==================================================================
+
+// f_phys port (chart TF, closed bars) -> velocity / accel / convexity /
+// efficiency / displacement / compression + the 5 observation scores
+void F16_Physics(){
+   int effLen=10; double atr=F16_ATR(_Period,14,1); if(atr<=0.0) atr=PipsToPrice(10.0);
+   if(ArraySize(gClose)<effLen+6) return;
+   double mv=MathAbs(gClose[1]-gClose[1+effLen]);
+   double ps=0.0; for(int i=1;i<=effLen;i++) ps+=MathAbs(gClose[i]-gClose[i+1]);
+   g_f16eff=(ps>0.0)?mv/ps:0.0;
+   g_f16disp=(gHigh[1]-gLow[1])/MathMax(atr,1e-10);
+   double vel=gClose[1]-gClose[2], velP=gClose[2]-gClose[3], velPP=gClose[3]-gClose[4];
+   g_f16vel=vel; g_f16acc=vel-velP; double accP=velP-velPP; g_f16conv=g_f16acc-accP;
+   double effT=0.65, dispT=1.5;
+   g_f16comp=MathMin(100.0,MathMax(0.0,(1.0-MathMin(g_f16disp/dispT,1.0))*60.0+(1.0-MathMin(g_f16eff/effT,1.0))*40.0));
+   double convScore=MathMin(MathAbs(g_f16conv)/MathMax(atr*0.01,1e-10)*25.0,100.0);
+   bool bDec=(MathAbs(g_f16acc)<MathAbs(accP)*0.8)&&vel>0;
+   bool rDec=(MathAbs(g_f16acc)<MathAbs(accP)*0.8)&&vel<0;
+   bool vd70=MathAbs(vel)<MathAbs(velP)*0.7, vd50=MathAbs(vel)<MathAbs(velP)*0.5;
+   g_f16impBull=(g_f16eff>effT&&vel>velP&&g_f16acc>0&&gClose[1]>gOpen[1]&&g_f16disp>dispT);
+   g_f16impBear=(g_f16eff>effT&&vel<velP&&g_f16acc<0&&gClose[1]<gOpen[1]&&g_f16disp>dispT);
+   g_f16obsExp=MathMin((g_f16eff>effT?g_f16eff*60.0:g_f16eff*30.0)+(g_f16disp>dispT?(g_f16disp/dispT-1.0)*20.0:0.0)+(((vel>0&&g_f16acc>0)||(vel<0&&g_f16acc<0))?20.0:0.0),100.0);
+   g_f16obsDecay=MathMin(((bDec||rDec)?40.0:0.0)+(convScore>30.0?convScore*0.5:0.0)+(vd70?30.0:0.0),100.0);
+   g_f16obsCurv=convScore;
+   g_f16obsAbs=MathMin((g_f16eff<effT*0.7?(1.0-g_f16eff/effT)*50.0:0.0)+(vd50?30.0:0.0)+(g_f16disp<dispT*0.5?20.0:0.0),100.0);
+   g_f16obsLiq=MathMin(g_f16obsDecay*0.4+g_f16obsCurv*0.4+((g_f16disp>dispT*1.2&&(bDec||rDec))?20.0:0.0),100.0);
+}
+
+// f_idealSim port — Euclidean fingerprint match (0..100)
+double F16_Sim(double e,double d,double v,double c,double ei,double di,double vi,double ci){
+   double diff=(e-ei)*(e-ei)+(d-di)*(d-di)+(v-vi)*(v-vi)+(c-ci)*(c-ci);
+   return MathMax(0.0,100.0*(1.0-diff/4.0));
+}
+
+// Belief engine — similarity fingerprints -> EMA-smoothed phase probabilities ->
+// a net belief DIRECTION (trend beliefs hold the prevailing dir, reversal flips it)
+void F16_Belief(){
+   double effT=0.65,dispT=1.5,atr=F16_ATR(_Period,14,1); if(atr<=0.0) atr=PipsToPrice(10.0);
+   double eN=MathMin(g_f16eff,1.0);
+   double dN=MathMin(g_f16disp/MathMax(dispT*2.0,1e-10),1.0);
+   double vN=MathMin(MathAbs(g_f16vel)/MathMax(atr*0.15,1e-10),1.0);
+   double cN=MathMin(MathAbs(g_f16conv)/MathMax(atr*0.02,1e-10),1.0);
+   double sExp   =F16_Sim(eN,dN,vN,cN,0.85,0.80,0.80,0.10);
+   double sPre   =F16_Sim(eN,dN,vN,cN,0.60,0.55,0.40,0.50);
+   double sAbs   =F16_Sim(eN,dN,vN,cN,0.20,0.25,0.10,0.40);
+   double sRetr  =F16_Sim(eN,dN,vN,cN,0.70,0.65,0.65,0.25);
+   double sCreate=F16_Sim(eN,dN,vN,cN,0.30,0.70,0.05,0.90);
+   double sReturn=F16_Sim(eN,dN,vN,cN,0.50,0.40,0.35,0.20);
+   int wd=g_f16netBias;
+   bool opposing=(wd==1&&g_f16impBear)||(wd==-1&&g_f16impBull);
+   double rExp   =MathMin(g_f16obsExp*0.45+((g_f16impBull||g_f16impBear)?30.0:0.0)+(g_f16eff>effT*1.1?15.0:0.0)+sExp*0.10,100.0);
+   double rCont  =MathMin(g_f16obsDecay*0.30+g_f16obsCurv*0.25+((g_f16impBull||g_f16impBear)?10.0:0.0)+sPre*0.10,100.0);
+   double rAbs   =MathMin(g_f16obsAbs*0.50+(g_f16eff<effT*0.6?25.0:0.0)+(g_f16disp<dispT*0.5?15.0:0.0)+sAbs*0.10,100.0);
+   double rRetr  =MathMin((opposing?45.0:0.0)+(rAbs>50.0?rAbs*0.30:0.0)+(g_f16obsCurv>40.0?15.0:0.0)+sRetr*0.10,100.0);
+   double rCreate=MathMin((g_f16obsDecay>60.0?g_f16obsDecay*0.20:0.0)+(g_f16obsLiq>50.0?g_f16obsLiq*0.20:0.0)+(g_f16obsAbs>20.0?g_f16obsAbs*0.15:0.0)+sCreate*0.10,100.0);
+   double rReturn=MathMin((rRetr>60.0?rRetr*0.30:0.0)+sReturn*0.10,100.0);
+   double a=2.0/(3.0+1.0);
+   g_f16bExp   +=a*(rExp-g_f16bExp);     g_f16bCont +=a*(rCont-g_f16bCont);
+   g_f16bAbsorb+=a*(rAbs-g_f16bAbsorb);  g_f16bRetr +=a*(rRetr-g_f16bRetr);
+   g_f16bCreate+=a*(rCreate-g_f16bCreate); g_f16bReturn+=a*(rReturn-g_f16bReturn);
+   double trend  =g_f16bExp+g_f16bCont+g_f16bCreate;
+   double against=g_f16bRetr+g_f16bAbsorb+g_f16bReturn;
+   g_f16beliefDir=(trend>against)?wd:(against>trend)?-wd:0;
+}
+
+// Energy / Resolution / Attractor (EDE/RE/EAE-lite) — expansion energy injected
+// vs dissipated -> residual; the attractor price + whether the objective is reached
+void F16_Energy(){
+   double effT=0.65,atr=F16_ATR(_Period,14,1); if(atr<=0.0) atr=PipsToPrice(10.0);
+   g_f16expEnergy =MathMin(g_f16obsExp*0.5+((g_f16impBull||g_f16impBear)?30.0:0.0)+g_f16eff*20.0,100.0);
+   g_f16dissEnergy=MathMin(g_f16obsDecay*0.4+g_f16obsCurv*0.3+g_f16obsLiq*0.3,100.0);
+   g_f16residual  =MathMax(0.0,g_f16expEnergy-g_f16dissEnergy);
+   g_f16eaePrice  =(g_f16attrPrice>0.0)?g_f16attrPrice:(g_f16netBias>=0?g_f16fezHi:g_f16fezLo);
+   double cl=gClose[1];
+   if(g_f16eaePrice>0.0){
+      double dist=MathAbs(g_f16eaePrice-cl);
+      g_f16objDistPct=MathMin(100.0,dist/MathMax(atr*3.0,1e-10)*100.0);
+      g_f16objArrival=(dist<atr*0.75)&&(g_f16eff<effT*0.7);
+   } else { g_f16objArrival=false; g_f16objDistPct=100.0; }
+   g_f16resCode=((g_f16residual<25.0)&&g_f16objArrival)?2:((g_f16objDistPct<40.0)&&(g_f16dissEnergy>=50.0))?1:0;
+}
+
+// Liquidity heat at the target — reuses the spec liquidity pools (the right tool).
+// High heat = a firm magnet (good TP); a vacuum = open runway (let the runner breathe)
+void F16_TargetHeat(){
+   double tgt=(g_f16eaePrice>0.0)?g_f16eaePrice:gClose[1];
+   double atr=F16_ATR(_Period,14,1); if(atr<=0.0) atr=PipsToPrice(10.0);
+   double radius=atr*1.0, dens=0.0;
+   for(int i=0;i<ArraySize(g_liq);i++){
+      double d=MathAbs(g_liq[i].price-tgt);
+      if(d<radius) dens+=(g_liq[i].isGrabbed?0.3:1.0)*(1.0-d/radius);
+   }
+   g_f16targetHeat=MathMin(100.0,dens*40.0);
+   g_f16targetVacuum=(g_f16targetHeat<20.0);
+}
+
+// DECISION RESOLVER — the single arbitration point every engine feeds.
+// It sets size (opportunity+belief+heat), the runner target (network+heat), and
+// the take/skip verdict (each veto owned by the engine designed to forbid it).
+// It NEVER changes the entry trigger or the SL geometry.
+void F16_Decision(int dir){
+   g_f16decVeto=false; g_f16decReason="";
+   // SIZE — opportunity owns "how much"; belief tilts it; a vacuum to target lets it breathe
+   double f=MathMax(0.0,MathMin(1.0,g_f16confidence/100.0));
+   double sz=InpF16OppSizeMin+(InpF16OppSizeMax-InpF16OppSizeMin)*f;
+   if(g_f16beliefDir==dir) sz*=1.10; else if(g_f16beliefDir==-dir) sz*=0.80;
+   if(g_f16targetVacuum) sz*=1.05;
+   g_f16decSize=MathMax(0.4,MathMin(InpF16OppSizeMax,sz));
+   // TARGET — network + heat own "which target"
+   g_f16decTarget=(g_f16eaePrice>0.0)?g_f16eaePrice:0.0;
+   // VETOES — each engine forbids only the trade IT is designed to forbid
+   if(InpF16VetoFullOpp && F16_FullOpposition(dir)){ g_f16decVeto=true; g_f16decReason="network+MTF+time oppose"; return; }
+   if(InpF16GateReversal && g_f16beliefDir==-dir && (g_f16bRetr>=InpF16ReversalBlk||g_f16bAbsorb>=InpF16ReversalBlk) && g_f16bRetr>g_f16bCont){
+      g_f16decVeto=true; g_f16decReason="reversal/absorption belief dominant"; return; }
+   if(InpF16GateObjective && g_f16resCode==2){ g_f16decVeto=true; g_f16decReason="objective reached / energy resolved"; return; }
+   if(InpF16GateCycle){
+      double ex=(dir==1)?g_f16cycExhLong:g_f16cycExhShort;
+      if(ex>=100.0){ g_f16decVeto=true; g_f16decReason="HTF time-cycle exhausted vs dir"; return; }
+   }
+   if(InpF16GateGrade && (g_f16oppGrade=="NO-TRADE" || g_f16threat>=InpF16ThreatBlock)){
+      g_f16decVeto=true; g_f16decReason="grade NO-TRADE / threat high"; return; }
 }

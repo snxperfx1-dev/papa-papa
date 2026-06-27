@@ -80,6 +80,10 @@ input double InpChochBufferATR    = 0.75;   // CHoCH buffer (ATR)
 //==================================================================
 input double InpLifeDeadExit      = 33.0;   // EXIT: life <= this (crossunder) closes that direction
 input double InpLifeReviveLevel   = 60.0;   // life >= this = healthy hold (alert/dashboard only)
+input bool   InpUseLifeExit       = true;   // EXIT: let the life score close positions
+input double InpLifeArmLevel      = 55.0;   // life must first reach this (campaign got healthy) before a dead-cross can exit
+input int    InpLifeExitGraceBars = 12;     // no life/chain exit within N bars of the last entry (per direction)
+input bool   InpUseChainDecayExit = false;  // also exit on whole-chain decay (aggressive; off by default)
 input bool   InpShowDashboard     = true;   // Print Comment() dashboard
 // --- curve-tree entry gate + all-timeframe entries (LIFE NOT USED FOR ENTRIES) ---
 input bool   InpRequireCurveOwner = true;   // Require curve-tree owner not opposed to the entry dir
@@ -205,6 +209,12 @@ bool     g_longBEActive     = false;
 bool     g_shortBEActive    = false;
 bool     g_longTrailActive  = false;
 bool     g_shortTrailActive = false;
+
+// life-exit guards: arm-before-die + grace window after the last entry (per direction)
+int      g_longLastEntryBar  = -100000;
+int      g_shortLastEntryBar = -100000;
+bool     g_longLifeArmed     = false;
+bool     g_shortLifeArmed    = false;
 
 //==================================================================
 // 6. POSITION SORT STRUCT
@@ -1576,16 +1586,32 @@ void ManageExits()
    bool exitShort = false;
    string reasonL = "", reasonS = "";
 
-   // ---------- LIFE-SCORE EXIT (primary) ----------
-   if(CountDirectionPositions(1) > 0 && gLong.LifeDeadCross())
+   int longPos  = CountDirectionPositions(1);
+   int shortPos = CountDirectionPositions(-1);
+
+   // ---- arm-before-die: a campaign must first get HEALTHY before life can kill it,
+   //      and reset the arm/last-entry when the book is flat ----
+   if(longPos == 0)  { g_longLifeArmed  = false; }
+   else if(gLong.m_life  >= InpLifeArmLevel) g_longLifeArmed  = true;
+   if(shortPos == 0) { g_shortLifeArmed = false; }
+   else if(gShort.m_life >= InpLifeArmLevel) g_shortLifeArmed = true;
+
+   // ---- grace window: never let life/chain cut within N bars of the last entry ----
+   bool longGraceOK  = (g_barCount - g_longLastEntryBar)  >= InpLifeExitGraceBars;
+   bool shortGraceOK = (g_barCount - g_shortLastEntryBar) >= InpLifeExitGraceBars;
+
+   // ---------- LIFE-SCORE EXIT (only after armed + grace) ----------
+   if(InpUseLifeExit && longPos > 0 && g_longLifeArmed && longGraceOK && gLong.LifeDeadCross())
    { exitLong = true; reasonL = "LIFE DEAD"; }
-   if(CountDirectionPositions(-1) > 0 && gShort.LifeDeadCross())
+   if(InpUseLifeExit && shortPos > 0 && g_shortLifeArmed && shortGraceOK && gShort.LifeDeadCross())
    { exitShort = true; reasonS = "LIFE DEAD"; }
 
-   // whole-chain collapse: bleed-out across the lineage = stand down
-   if(!exitLong  && CountDirectionPositions(1)  > 0 && gLong.m_chainScope  == "WHOLE CHAIN decaying" && gLong.m_life  < InpLifeDeadExit)
+   // whole-chain collapse (optional, gated identically)
+   if(InpUseChainDecayExit && !exitLong  && longPos  > 0 && g_longLifeArmed  && longGraceOK
+      && gLong.m_chainScope  == "WHOLE CHAIN decaying" && gLong.m_life  < InpLifeDeadExit)
    { exitLong = true;  reasonL = "CHAIN DECAY"; }
-   if(!exitShort && CountDirectionPositions(-1) > 0 && gShort.m_chainScope == "WHOLE CHAIN decaying" && gShort.m_life < InpLifeDeadExit)
+   if(InpUseChainDecayExit && !exitShort && shortPos > 0 && g_shortLifeArmed && shortGraceOK
+      && gShort.m_chainScope == "WHOLE CHAIN decaying" && gShort.m_life < InpLifeDeadExit)
    { exitShort = true; reasonS = "CHAIN DECAY"; }
 
    // ---------- ARC EXHAUSTION + PHASE COLLAPSE + INSTITUTIONAL ----------
@@ -1668,7 +1694,7 @@ void TryEnterLongTF(int idx, double riskCash)
    double lots = ComputeLots(riskCash, entry, sl);
    lots = AdjustLotsForBasketCeiling(1, entry, sl, lots);
    if(lots > 0.0 && SendMarketOrder(+1, lots, sl, "SYM P"+IntegerToString(ph)+" Long "+g_mtfLbl[idx]))
-      gTFEng[idx].LlastTrade = tfBar;
+   { gTFEng[idx].LlastTrade = tfBar; g_longLastEntryBar = g_barCount; }
 }
 
 void TryEnterShortTF(int idx, double riskCash)
@@ -1690,7 +1716,7 @@ void TryEnterShortTF(int idx, double riskCash)
    double lots = ComputeLots(riskCash, entry, sl);
    lots = AdjustLotsForBasketCeiling(-1, entry, sl, lots);
    if(lots > 0.0 && SendMarketOrder(-1, lots, sl, "SYM P"+IntegerToString(ph)+" Short "+g_mtfLbl[idx]))
-      gTFEng[idx].SlastTrade = tfBar;
+   { gTFEng[idx].SlastTrade = tfBar; g_shortLastEntryBar = g_barCount; }
 }
 
 void ExecuteTrading()
@@ -1901,6 +1927,8 @@ int OnInit()
    g_longRungs = g_shortRungs = 0;
    g_longBEActive = g_shortBEActive = false;
    g_longTrailActive = g_shortTrailActive = false;
+   g_longLastEntryBar = g_shortLastEntryBar = -100000;
+   g_longLifeArmed = g_shortLifeArmed = false;
 
    // curve campaigns
    gLong.Init(1);

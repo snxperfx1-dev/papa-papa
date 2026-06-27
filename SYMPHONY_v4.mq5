@@ -104,6 +104,8 @@ input int    InpRotExitCount      = 2;      // EXIT rotation depth: need this ma
 // --- zone-based entries: buys at higher-TF demand, sells at higher-TF supply, when rotation confirmed ---
 input double InpZoneApproachATR   = 1.0;    // price must be within this many ATR of the higher-TF S/D zone to enter
 input double InpZoneSLBufferATR   = 0.5;    // stop placed this many ATR beyond the zone
+input double InpZoneSideTolATR    = 0.25;   // allowed wick THROUGH the zone (wrong side) before it's rejected
+input double InpMinSLATR          = 0.8;    // minimum stop distance in ATR (prevents micro-stops -> huge lots)
 input bool   InpRequireCleanRotation = false; // require a clean (bottom-led) cascade before entering
 input bool   InpRequirePhaseTrigger = true; // require a P3/P4 phase (timing) in the entry direction to fire
 input int    InpZoneFromTFIndex   = 0;      // lowest TF whose S/D zone can be traded (0 = M1)
@@ -2037,8 +2039,14 @@ bool AtHigherTFZone(int dir, double px, double atr, int &tfOut, double &zoneOut)
    {
       double z = (dir == 1) ? g_mtfDemand[i] : g_mtfSupply[i];
       if(z <= 0.0) continue;
-      double d = MathAbs(px - z) / MathMax(atr, 1e-9);
-      if(d <= InpZoneApproachATR && d < bestD) { bestD = d; tfOut = i; zoneOut = z; }
+      // SIDE-CORRECT: buy only a demand AT/BELOW price (support); sell only a supply
+      // AT/ABOVE price (resistance). A small tolerance allows a shallow wick through.
+      double sgn = (dir == 1) ? (px - z) : (z - px);   // >0 = correct side
+      double sATR = sgn / MathMax(atr, 1e-9);
+      if(sATR < -InpZoneSideTolATR) continue;          // zone is on the wrong side (broken)
+      if(sATR > InpZoneApproachATR) continue;          // too far to be "at" the zone
+      double prox = MathAbs(sATR);
+      if(prox < bestD) { bestD = prox; tfOut = i; zoneOut = z; }
    }
    return (tfOut >= 0);
 }
@@ -2147,6 +2155,8 @@ void ExecuteTrading()
    {
       double entry = close;
       double sl    = zone - InpZoneSLBufferATR * atr;   // structural stop below the demand
+      double minD  = InpMinSLATR * atr;
+      if(entry - sl < minD) sl = entry - minD;           // floor the stop distance
       if(sl > 0.0 && entry > sl)
       {
          double lots = ComputeLots(riskCash, entry, sl);
@@ -2165,6 +2175,8 @@ void ExecuteTrading()
    {
       double entry = close;
       double sl    = zone + InpZoneSLBufferATR * atr;   // structural stop above the supply
+      double minD  = InpMinSLATR * atr;
+      if(sl - entry < minD) sl = entry + minD;           // floor the stop distance
       if(sl > 0.0 && sl > entry)
       {
          double lots = ComputeLots(riskCash, entry, sl);

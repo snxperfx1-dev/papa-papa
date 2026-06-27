@@ -104,6 +104,8 @@ input double InpZoneApproachATR   = 1.0;    // price must be within this many AT
 input double InpZoneSLBufferATR   = 0.5;    // stop placed this many ATR beyond the zone
 input bool   InpRequireCleanRotation = false; // require a clean (bottom-led) cascade before entering
 input bool   InpRequirePhaseTrigger = true; // require a P3/P4 phase (timing) in the entry direction to fire
+input int    InpZoneFromTFIndex   = 1;      // lowest TF whose S/D zone can be traded (1 = M5)
+input int    InpZoneOpenAhead     = 1;      // rotation opens zones up to this many TFs above the cascade front
 // --- direction memory + cross-timeframe phase confluence ---
 input int    InpMTFConfirmBars    = 3;      // a TF's direction must confirm this many bars before it flips (anti-whipsaw)
 input bool   InpRequirePhaseConfluence = true; // entries must be nested under agreeing phases across timeframes
@@ -1949,15 +1951,20 @@ bool CurveAllowsShort()
    return true;
 }
 
-// Is price AT a higher-timeframe zone? dir=+1 -> a DEMAND (support) to BUY from;
-// dir=-1 -> a SUPPLY (resistance) to SELL from. Scans parent timeframes for the
-// nearest such zone within InpZoneApproachATR of price.
+// Is price AT an OPENED-UP timeframe zone? dir=+1 -> DEMAND (support) to BUY from;
+// dir=-1 -> SUPPLY (resistance) to SELL from. The rotation OPENS zones from a low
+// floor (InpZoneFromTFIndex, e.g. M5) up to just ahead of how far the cascade has
+// climbed (g_cascadeDepth + InpZoneOpenAhead) — so an M1-led rotation makes M5/M15
+// tradeable, and higher zones open as the rotation propagates up.
 bool AtHigherTFZone(int dir, double px, double atr, int &tfOut, double &zoneOut)
 {
    tfOut = -1; zoneOut = 0.0;
-   int lo = (InpParentFromTFIndex < 0) ? 0 : (InpParentFromTFIndex > 7 ? 7 : InpParentFromTFIndex);
+   int loZ = (InpZoneFromTFIndex < 0) ? 0 : (InpZoneFromTFIndex > 7 ? 7 : InpZoneFromTFIndex);
+   int hiZ = g_cascadeDepth + InpZoneOpenAhead;
+   if(hiZ > 7) hiZ = 7;
+   if(hiZ < loZ) hiZ = loZ;
    double bestD = 1e9;
-   for(int i = lo; i < 8; i++)
+   for(int i = loZ; i <= hiZ; i++)
    {
       double z = (dir == 1) ? g_mtfDemand[i] : g_mtfSupply[i];
       if(z <= 0.0) continue;

@@ -84,6 +84,11 @@ input bool   InpUseLifeExit       = true;   // EXIT: let the life score close po
 input double InpLifeArmLevel      = 55.0;   // life must first reach this (campaign got healthy) before a dead-cross can exit
 input int    InpLifeExitGraceBars = 12;     // no life/chain exit within N bars of the last entry (per direction)
 input bool   InpUseChainDecayExit = false;  // also exit on whole-chain decay (aggressive; off by default)
+// --- destination-aware exit: only let life cut after expansion, at/near parent S/D ---
+input bool   InpUseParentExit     = true;   // life exit ONLY after expansion + at/approaching parent supply/demand
+input double InpExpandMinATR      = 2.0;    // owner curve must have travelled >= this (ATR) to count as "expanded"
+input double InpParentApproachATR = 2.0;    // within this many ATR of parent S/D = "approaching"
+input int    InpParentFromTFIndex = 3;      // lowest TF index treated as parent (0=M1 1=M5 2=M15 3=H1 4=H4 5=D1)
 input bool   InpShowDashboard     = true;   // Print Comment() dashboard
 // --- curve-tree entry gate + all-timeframe entries (LIFE NOT USED FOR ENTRIES) ---
 input bool   InpRequireCurveOwner = true;   // Require curve-tree owner not opposed to the entry dir
@@ -1573,6 +1578,47 @@ void RunProfitLadder()
 //   crossing below the dead threshold = ownership transferred =>
 //   close that direction's book ("DEAD - FLIP").
 //==================================================================
+// nearest higher-timeframe SUPPLY above price (the resistance a long is travelling into)
+double ParentSupplyAbove(double px, double atr, double &roomATR)
+{
+   roomATR = 1e9; double best = 0.0;
+   int lo = (InpParentFromTFIndex < 0) ? 0 : (InpParentFromTFIndex > 5 ? 5 : InpParentFromTFIndex);
+   for(int i = lo; i < 6; i++)
+   {
+      double cand[3];
+      cand[0] = gTFEng[i].SanchorHigh;   // short-impulse origin high (supply)
+      cand[1] = gTFEng[i].LanchorHigh;   // long-impulse high (resistance)
+      cand[2] = gTFEng[i].SinducPrice;   // short flip / induc zone
+      for(int k = 0; k < 3; k++)
+      {
+         double v = cand[k];
+         if(v > px && (best == 0.0 || v < best)) best = v;   // nearest above
+      }
+   }
+   if(best > 0.0) roomATR = (best - px) / MathMax(atr, 1e-9);
+   return best;
+}
+// nearest higher-timeframe DEMAND below price (the support a short is travelling into)
+double ParentDemandBelow(double px, double atr, double &roomATR)
+{
+   roomATR = 1e9; double best = 0.0;
+   int lo = (InpParentFromTFIndex < 0) ? 0 : (InpParentFromTFIndex > 5 ? 5 : InpParentFromTFIndex);
+   for(int i = lo; i < 6; i++)
+   {
+      double cand[3];
+      cand[0] = gTFEng[i].LanchorLow;    // long-impulse origin low (demand)
+      cand[1] = gTFEng[i].SanchorLow;    // short-impulse low (support)
+      cand[2] = gTFEng[i].LinducPrice;   // long flip / induc zone
+      for(int k = 0; k < 3; k++)
+      {
+         double v = cand[k];
+         if(v > 0.0 && v < px && v > best) best = v;   // nearest below
+      }
+   }
+   if(best > 0.0) roomATR = (px - best) / MathMax(atr, 1e-9);
+   return best;
+}
+
 void ManageExits()
 {
    int barsAvail = (int)ArraySize(Close);
@@ -1600,17 +1646,38 @@ void ManageExits()
    bool longGraceOK  = (g_barCount - g_longLastEntryBar)  >= InpLifeExitGraceBars;
    bool shortGraceOK = (g_barCount - g_shortLastEntryBar) >= InpLifeExitGraceBars;
 
-   // ---------- LIFE-SCORE EXIT (only after armed + grace) ----------
-   if(InpUseLifeExit && longPos > 0 && g_longLifeArmed && longGraceOK && gLong.LifeDeadCross())
-   { exitLong = true; reasonL = "LIFE DEAD"; }
-   if(InpUseLifeExit && shortPos > 0 && g_shortLifeArmed && shortGraceOK && gShort.LifeDeadCross())
-   { exitShort = true; reasonS = "LIFE DEAD"; }
+   // ---- DESTINATION gate: only allow a life cut once the owner curve has EXPANDED
+   //      and price is AT/APPROACHING the parent HTF supply/demand (owner-driven
+   //      destination). Stops the early noise-cuts; the cut now lands at the target. ----
+   double atrG    = (atrNow > 0.0 ? atrNow : GetATR(1));
+   double travelL = (gLong.m_ownExtreme  > 0.0 && gLong.m_ownOrigin  > 0.0) ? (gLong.m_ownExtreme  - gLong.m_ownOrigin)  : 0.0;
+   double travelS = (gShort.m_ownExtreme > 0.0 && gShort.m_ownOrigin > 0.0) ? (gShort.m_ownOrigin  - gShort.m_ownExtreme) : 0.0;
+   bool   expandedLong  = (travelL >= InpExpandMinATR * atrG);
+   bool   expandedShort = (travelS >= InpExpandMinATR * atrG);
+   double roomL = 1e9, roomS = 1e9;
+   double parSupL = ParentSupplyAbove(closeNow, atrG, roomL);
+   double parDemS = ParentDemandBelow(closeNow, atrG, roomS);
+   bool   nearParentL = (parSupL > 0.0 && roomL <= InpParentApproachATR);
+   bool   nearParentS = (parDemS > 0.0 && roomS <= InpParentApproachATR);
+   bool   destLong  = (!InpUseParentExit) || (expandedLong  && nearParentL);
+   bool   destShort = (!InpUseParentExit) || (expandedShort && nearParentS);
 
-   // whole-chain collapse (optional, gated identically)
-   if(InpUseChainDecayExit && !exitLong  && longPos  > 0 && g_longLifeArmed  && longGraceOK
+   // at the destination we exit on weakness (dead-cross OR life already below dead);
+   // away from it we never let life cut — the stop / ARC / ladder manage instead.
+   bool lifeWeakL = InpUseParentExit ? (gLong.LifeDeadCross()  || gLong.m_life  < InpLifeDeadExit) : gLong.LifeDeadCross();
+   bool lifeWeakS = InpUseParentExit ? (gShort.LifeDeadCross() || gShort.m_life < InpLifeDeadExit) : gShort.LifeDeadCross();
+
+   // ---------- LIFE-SCORE EXIT (armed + grace + expanded + at parent S/D) ----------
+   if(InpUseLifeExit && longPos > 0 && g_longLifeArmed && longGraceOK && destLong && lifeWeakL)
+   { exitLong = true; reasonL = (InpUseParentExit ? "LIFE@PARENT" : "LIFE DEAD"); }
+   if(InpUseLifeExit && shortPos > 0 && g_shortLifeArmed && shortGraceOK && destShort && lifeWeakS)
+   { exitShort = true; reasonS = (InpUseParentExit ? "LIFE@PARENT" : "LIFE DEAD"); }
+
+   // whole-chain collapse (optional, same gating)
+   if(InpUseChainDecayExit && !exitLong  && longPos  > 0 && g_longLifeArmed  && longGraceOK && destLong
       && gLong.m_chainScope  == "WHOLE CHAIN decaying" && gLong.m_life  < InpLifeDeadExit)
    { exitLong = true;  reasonL = "CHAIN DECAY"; }
-   if(InpUseChainDecayExit && !exitShort && shortPos > 0 && g_shortLifeArmed && shortGraceOK
+   if(InpUseChainDecayExit && !exitShort && shortPos > 0 && g_shortLifeArmed && shortGraceOK && destShort
       && gShort.m_chainScope == "WHOLE CHAIN decaying" && gShort.m_life < InpLifeDeadExit)
    { exitShort = true; reasonS = "CHAIN DECAY"; }
 
@@ -1877,6 +1944,15 @@ void UpdateDashboard()
    s += "TF PHASE: " + tfp + nl;
    s += "GATE: Lcurve " + (CurveAllowsLong()? "OPEN":"shut")
       + "  Scurve " + (CurveAllowsShort()? "OPEN":"shut") + nl;
+   double dRoomL = 1e9, dRoomS = 1e9, dAtr = GetATR(1);
+   double dSupL = ParentSupplyAbove(Close[1], dAtr, dRoomL);
+   double dDemS = ParentDemandBelow(Close[1], dAtr, dRoomS);
+   double dTravL = (gLong.m_ownExtreme  > 0.0 && gLong.m_ownOrigin  > 0.0) ? (gLong.m_ownExtreme - gLong.m_ownOrigin)  / MathMax(dAtr,1e-9) : 0.0;
+   double dTravS = (gShort.m_ownExtreme > 0.0 && gShort.m_ownOrigin > 0.0) ? (gShort.m_ownOrigin - gShort.m_ownExtreme) / MathMax(dAtr,1e-9) : 0.0;
+   s += "PARENT: L supply " + (dSupL>0.0? DoubleToString(dSupL,2)+" ("+DoubleToString(dRoomL,1)+" ATR)" : "-")
+      + " exp " + DoubleToString(dTravL,1)
+      + " | S demand " + (dDemS>0.0? DoubleToString(dDemS,2)+" ("+DoubleToString(dRoomS,1)+" ATR)" : "-")
+      + " exp " + DoubleToString(dTravS,1) + nl;
    s += "PHYS: comp " + DoubleToString(g_compIdx,0)
       + " (tighten " + DoubleToString(g_cmpTighten,0) + ")"
       + "  eff " + DoubleToString(g_eff,2)

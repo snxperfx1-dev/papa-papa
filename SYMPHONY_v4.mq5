@@ -83,6 +83,7 @@ input double InpLifeReviveLevel   = 60.0;   // life >= this = healthy hold (aler
 input bool   InpUseLifeExit       = true;   // EXIT: let the life score close positions
 input bool   InpManageOnlyAfterRotation = true; // profit-taking/management only after a new high/low is made AND price rotates
 input double InpManagePullbackATR = 1.0;    // pullback from the extreme (ATR) that counts as "rotating" -> management arms
+input double InpManageMinExpansionATR = 2.5; // campaign must EXPAND this many ATR from entry before management can arm
 input double InpLifeArmLevel      = 55.0;   // life must first reach this (campaign got healthy) before a dead-cross can exit
 input int    InpLifeExitGraceBars = 12;     // no life/chain exit within N bars of the last entry (per direction)
 input bool   InpUseChainDecayExit = false;  // also exit on whole-chain decay (aggressive; off by default)
@@ -260,6 +261,8 @@ bool     g_longNewHigh  = false;
 bool     g_shortNewLow  = false;
 double   g_longCycHigh  = 0.0;
 double   g_shortCycLow  = 0.0;
+double   g_longOriginPrice  = 0.0;   // price when the long book first opened (expansion anchor)
+double   g_shortOriginPrice = 0.0;
 
 //==================================================================
 // 6. POSITION SORT STRUCT
@@ -1311,10 +1314,12 @@ void UpdateHuntCycle()
 
    // up-cycle expanded into the PARENT SUPPLY -> take profit, switch to hunting sells
    if(g_huntMode == 1 && px >= g_flipSupply - band)
-   { if(longPos > 0) CloseDirection(1, "SYM TP PARENT supply"); g_huntMode = -1; return; }
+   { if(longPos > 0 && !ManageActive(1)) return;           // still riding to maturity: hold through the pole
+     if(longPos > 0) CloseDirection(1, "SYM TP PARENT supply"); g_huntMode = -1; return; }
    // down-cycle expanded into the PARENT DEMAND -> take profit, switch to hunting buys
    if(g_huntMode == -1 && px <= g_flipDemand + band)
-   { if(shortPos > 0) CloseDirection(-1, "SYM TP PARENT demand"); g_huntMode = 1; return; }
+   { if(shortPos > 0 && !ManageActive(-1)) return;
+     if(shortPos > 0) CloseDirection(-1, "SYM TP PARENT demand"); g_huntMode = 1; return; }
 
    // init / realign when flat: lower half of the HTF range -> expand UP; upper half -> expand DOWN
    if(g_huntMode == 0 || (longPos == 0 && shortPos == 0))
@@ -1856,24 +1861,28 @@ void UpdateMaturity()
    double atr = GetATR(1); if(atr <= 0.0) atr = 1e-6;
    int lp = CountDirectionPositions(1), sp = CountDirectionPositions(-1);
 
-   if(lp == 0) { g_longMatured = false; g_longNewHigh = false; g_longCycHigh = 0.0; }
+   if(lp == 0) { g_longMatured = false; g_longNewHigh = false; g_longCycHigh = 0.0; g_longOriginPrice = 0.0; }
    else
    {
+      if(g_longOriginPrice == 0.0) g_longOriginPrice = Close[1];
       if(g_longCycHigh == 0.0) g_longCycHigh = High[1];
       g_longCycHigh = MathMax(g_longCycHigh, High[1]);
       if(NewHighMade()) g_longNewHigh = true;
+      bool expanded = (g_longCycHigh - g_longOriginPrice) >= InpManageMinExpansionATR * atr;
       bool rotating = (Close[1] < g_longCycHigh - InpManagePullbackATR * atr) || (g_mtfDir[0] == -1);
-      if(g_longNewHigh && rotating) g_longMatured = true;
+      if(expanded && rotating) g_longMatured = true;
    }
 
-   if(sp == 0) { g_shortMatured = false; g_shortNewLow = false; g_shortCycLow = 0.0; }
+   if(sp == 0) { g_shortMatured = false; g_shortNewLow = false; g_shortCycLow = 0.0; g_shortOriginPrice = 0.0; }
    else
    {
+      if(g_shortOriginPrice == 0.0) g_shortOriginPrice = Close[1];
       if(g_shortCycLow == 0.0) g_shortCycLow = Low[1];
       g_shortCycLow = MathMin(g_shortCycLow, Low[1]);
       if(NewLowMade()) g_shortNewLow = true;
+      bool expanded = (g_shortOriginPrice - g_shortCycLow) >= InpManageMinExpansionATR * atr;
       bool rotating = (Close[1] > g_shortCycLow + InpManagePullbackATR * atr) || (g_mtfDir[0] == 1);
-      if(g_shortNewLow && rotating) g_shortMatured = true;
+      if(expanded && rotating) g_shortMatured = true;
    }
 }
 // Is profit-taking/management allowed for this direction yet?
@@ -2106,21 +2115,21 @@ void ManageExits()
    bool phaseEndLong  = (gL_active && (gL_prevPhase == 3 || gL_prevPhase == 4) && gL_phase <= 1);
    bool phaseEndShort = (gS_active && (gS_prevPhase == 3 || gS_prevPhase == 4) && gS_phase <= 1);
 
-   if(!exitLong && gL_active && arcExhaustLong && phaseEndLong)
+   if(!exitLong && ManageActive(1) && gL_active && arcExhaustLong && phaseEndLong)
    {
       bool hasInstL = (instLevelL > 0.0);
       if(!hasInstL || (gL_outerBreach && closeNow < innerTopL)) { exitLong = true; reasonL = "ARC/PHASE"; }
    }
-   if(!exitShort && gS_active && arcExhaustShort && phaseEndShort)
+   if(!exitShort && ManageActive(-1) && gS_active && arcExhaustShort && phaseEndShort)
    {
       bool hasInstS = (instLevelS > 0.0);
       if(!hasInstS || (gS_outerBreach && closeNow > innerBotS)) { exitShort = true; reasonS = "ARC/PHASE"; }
    }
 
    // ---------- MODE-INVALIDATION-AT-PEAK ----------
-   if(!exitLong  && gL_modeInvalid && (gL_phaseAtInvalid == 3 || gL_phaseAtInvalid == 4))
+   if(!exitLong  && ManageActive(1)  && gL_modeInvalid && (gL_phaseAtInvalid == 3 || gL_phaseAtInvalid == 4))
    { exitLong = true;  reasonL = "INVALID@PEAK"; }
-   if(!exitShort && gS_modeInvalid && (gS_phaseAtInvalid == 3 || gS_phaseAtInvalid == 4))
+   if(!exitShort && ManageActive(-1) && gS_modeInvalid && (gS_phaseAtInvalid == 3 || gS_phaseAtInvalid == 4))
    { exitShort = true; reasonS = "INVALID@PEAK"; }
 
    if(exitLong)  { Print("SYM EXIT LONG  reason=",reasonL," life=",DoubleToString(gLong.m_life,0));  if(InpDebugLog){ Print("   MTF: ",DbgMTFMap()); Print("   CASCADE: ",DbgCascade()); } CloseDirection(1,  "SYM EXIT "+reasonL); }
@@ -2566,7 +2575,7 @@ int OnInit()
    g_prevCascadeDir = 0; g_sellContext = false; g_buyContext = false; g_sellCtxTF = -1; g_buyCtxTF = -1;
    g_huntMode = 0; g_flip = 0.0; g_flipSupply = 0.0; g_flipDemand = 0.0;
    g_longMatured = false; g_shortMatured = false; g_longNewHigh = false; g_shortNewLow = false;
-   g_longCycHigh = 0.0; g_shortCycLow = 0.0;
+   g_longCycHigh = 0.0; g_shortCycLow = 0.0; g_longOriginPrice = 0.0; g_shortOriginPrice = 0.0;
 
    // per-timeframe structure engines + ATR handles
    for(int i = 0; i < 9; i++)

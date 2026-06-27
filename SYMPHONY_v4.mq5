@@ -118,6 +118,7 @@ input int    InpMajorFromTFIndex  = 4;      // lowest TF treated as a MAJOR reve
 input double InpMajorZoneATR      = 3.0;    // the cascade flip must occur within this many ATR of the major zone
 // --- direction memory + cross-timeframe phase confluence ---
 input int    InpMTFConfirmBars    = 3;      // a TF's direction must confirm this many bars before it flips (anti-whipsaw)
+input int    InpExtremeLookback   = 6;      // bars defining a "fresh" new high/low; rotation there bypasses the debounce
 input bool   InpRequirePhaseConfluence = true; // entries must be nested under agreeing phases across timeframes
 input int    InpMinPhaseConfluence = 2;     // min # of timeframes in the entry direction's phase/structure
 input bool   InpTradeAllTF        = true;   // Fire P3/P4 from every timeframe curve (not just chart)
@@ -1001,6 +1002,24 @@ void TF_Read(ENUM_TIMEFRAMES tf, int &dir, double &origin, double &extreme)
    }
 }
 
+// Did the last closed bar print a FRESH new high / low over InpExtremeLookback bars?
+bool NewHighMade()
+{
+   int N = (InpExtremeLookback < 2) ? 2 : InpExtremeLookback;
+   if((int)ArraySize(High) < N + 2) return false;
+   double h = High[1];
+   for(int k = 2; k <= N; k++) if(High[k] >= h) return false;
+   return true;
+}
+bool NewLowMade()
+{
+   int N = (InpExtremeLookback < 2) ? 2 : InpExtremeLookback;
+   if((int)ArraySize(Low) < N + 2) return false;
+   double l = Low[1];
+   for(int k = 2; k <= N; k++) if(Low[k] <= l) return false;
+   return true;
+}
+
 void UpdateMTFMap()
 {
    for(int i = 0; i < 9; i++)
@@ -1008,10 +1027,21 @@ void UpdateMTFMap()
       int rawDir = 0; double o = 0.0, e = 0.0;
       TF_Read(g_mtfTF[i], rawDir, o, e);
 
-      // --- DIRECTION MEMORY / debounce: build a picture over time so the read does
-      //     not flip sell<->buy bar to bar. A flip only commits after the new
-      //     direction has held for InpMTFConfirmBars; a neutral read keeps the last. ---
-      if(rawDir != 0 && rawDir != g_mtfDir[i])
+      // --- FAST-FLIP at a FRESH EXTREME: a new high with M1 rotating bearish (or a new
+      //     low with M1 bullish) is a decisive reversal AT the extreme (the high/low IS
+      //     a supply/demand). Commit M1 immediately, bypassing the debounce, so we never
+      //     buy a rotated-bearish new high (or sell a rotated-bullish new low). ---
+      bool fastFlip = (i == 0) && rawDir != 0 && rawDir != g_mtfDir[i] &&
+                      ((rawDir == -1 && NewHighMade()) || (rawDir == 1 && NewLowMade()));
+      if(fastFlip)
+      {
+         g_mtfPrevDir[i] = g_mtfDir[i];
+         g_mtfDir[i]     = rawDir;
+         g_mtfRotBar[i]  = g_barCount;
+         g_mtfPendCount[i] = 0; g_mtfPendDir[i] = 0;
+      }
+      // --- DIRECTION MEMORY / debounce (normal flips) ---
+      else if(rawDir != 0 && rawDir != g_mtfDir[i])
       {
          if(rawDir == g_mtfPendDir[i]) g_mtfPendCount[i]++;
          else { g_mtfPendDir[i] = rawDir; g_mtfPendCount[i] = 1; }

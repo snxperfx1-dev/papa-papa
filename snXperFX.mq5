@@ -324,6 +324,47 @@ bool   g_chkF16=true;   // F16 confluence checklist result (network/belief/grade
 bool   g_f16poiAnchored=false; int g_f16poiNodeWt=0; double g_f16poiNodePx=0.0; // POI precision anchored to a network FU node
 
 //==================================================================
+// SYMPHONY PHASE ENGINE (ported curvature engine — native entry path)
+//   Impulse/anchor detection, Phase 1-4 (long & short), inducement
+//   flipzone, ARC convexity target, and the precise P3/P4 entries with
+//   anchor-ATR stops. Every entry is routed through the F16 decision /
+//   confluence / FU-anchor layer and snXperFX's guards / risk / order /
+//   adopt / management / audit. (DRDWCT risk engine intentionally omitted
+//   — snXperFX already has its own equity guards.)
+//==================================================================
+input group "═══ Symphony Phase Engine ═══"
+input bool   InpSymEnable        = true;  // enable the ported Symphony Phase 3/4 entry path
+input int    InpSymATRLen        = 14;    // ATR length for the phase engine
+input double InpSymImpulseAtr    = 1.5;   // impulse = leg > this * ATR
+input double InpSymRetrMin       = 0.30;  // min retracement (fraction of the impulse leg)
+input double InpSymRetrMax       = 0.80;  // max retracement before the impulse is void
+input int    InpSymInducLook     = 80;    // inducement / flipzone lookback (bars)
+input double InpSymInducZoneATR  = 0.25;  // flipzone half-width (ATR)
+input int    InpSymArcHorizon    = 80;    // ARC horizon (bars)
+input double InpSymConvPower     = 1.5;   // ARC convexity power
+input double InpSymArcExt        = 1.5;   // ARC extension (impulse multiple)
+input double InpSymOuterBandATR  = 0.75;  // outer institutional band distance (ATR)
+input double InpSymArcTolATR     = 0.20;  // how close to the ARC counts as exhausted (ATR)
+input bool   InpSymUseF16        = true;  // route Symphony entries through the F16 decision / confluence / anchor layer
+
+// pivot history (chart series)
+double sym_lastPivotPrice=0.0; int sym_lastPivotShift=-1; int sym_lastPivotDir=0;
+double sym_prevPivotPrice=0.0; int sym_prevPivotShift=-1; int sym_prevPivotDir=0;
+// impulse / mode + anchors
+int    sym_mode=0; double sym_anchorHigh=0.0, sym_anchorLow=0.0; int sym_anchorHighShift=-1, sym_anchorLowShift=-1;
+// phases (1-4) per direction
+int    sym_phaseLong=0, sym_phaseShort=0, sym_prevPhaseLong=0, sym_prevPhaseShort=0;
+// inducement / flipzone
+double sym_longInducPrice=0.0, sym_longInducLow=0.0, sym_longInducHigh=0.0;
+double sym_shortInducPrice=0.0, sym_shortInducLow=0.0, sym_shortInducHigh=0.0;
+// pre-convexity latch + ARC + outer-band sweep flags
+bool   sym_longPreConvSeen=false, sym_shortPreConvSeen=false;
+double sym_arcLong=0.0, sym_arcShort=0.0;
+bool   sym_longOuterBreachSeen=false, sym_shortOuterBreachSeen=false;
+// one entry per direction per bar
+datetime sym_lastLongTradeTime=0, sym_lastShortTradeTime=0;
+
+//==================================================================
 // SERIES + BASIC HELPERS
 //==================================================================
 bool RefreshSeries(int need=800)
@@ -1170,6 +1211,13 @@ void UpdateDashboard(){
       s+="F16 ANCHOR "+(g_f16poiAnchored?(F16_WtLabel(g_f16poiNodeWt)+" FU @ "+DoubleToString(g_f16poiNodePx,_Digits)+" (precise)"):"spec pivot")
         +"  fresh-FU "+((g_setupDir!=0&&F16_FreshFU(g_setupDir))?"yes":"no")+nl;
    }
+   if(InpSymEnable){
+      int sp=(sym_mode==1?sym_phaseLong:sym_mode==-1?sym_phaseShort:0);
+      s+="SYM "+(sym_mode==1?"^LONG":sym_mode==-1?"vSHORT":"-")+" PHASE "+IntegerToString(sp)
+        +(sp>=3?" *ENTRY*":sp==2?" (aggr)":"")
+        +"  anchor "+DoubleToString(sym_anchorLow,_Digits)+"/"+DoubleToString(sym_anchorHigh,_Digits)
+        +"  ARC "+DoubleToString(sym_mode==1?sym_arcLong:sym_arcShort,_Digits)+nl;
+   }
    Comment(s);
 }
 
@@ -1181,7 +1229,9 @@ void RunPipeline(){
    BuildStructuralCascade();
    RebuildLiquidityMap();
    F16_Update();          // F16 context layer: network / time / opportunity (scores+sizes+targets only)
-   RunLifecycle();
+   if(InpSymEnable){ Sym_UpdatePhaseEngine(); Sym_UpdateARC(); Sym_ManageExits(); } // Symphony phase engine + composite exits
+   RunLifecycle();        // spec ICT lifecycle entry path
+   if(InpSymEnable) Sym_ExecuteEntries();   // Symphony Phase 3/4 entry path (F16-gated)
 }
 
 //==================================================================
@@ -1598,4 +1648,272 @@ double F16_AnchorPrecision(int dir,double zoneLo,double zoneHi,double curPrec){
    if(bestRank<0.0) return curPrec;                   // no aligned FU -> keep the spec precision
    g_f16poiAnchored=true; g_f16poiNodeWt=bestWt; g_f16poiNodePx=bestPx;
    return bestPx;                                     // entry taken off the precise FU wick
+}
+
+
+
+//==================================================================
+// SYMPHONY PHASE ENGINE — ported logic (uses gClose/gHigh/gLow series)
+//==================================================================
+double Sym_ATR(int shift){ double a=F16_ATR(_Period,InpSymATRLen,shift); return (a>0.0?a:PipsToPrice(10.0)); }
+
+bool Sym_PivotHigh(int c){
+   int n=ArraySize(gHigh); if(c<=0||c>=n) return false;
+   double h=gHigh[c];
+   for(int k=1;k<=InpPivotLen;k++){
+      if(c+k>=n||c-k<0) return false;
+      if(h<=gHigh[c+k]||h<=gHigh[c-k]) return false;
+   }
+   return true;
+}
+bool Sym_PivotLow(int c){
+   int n=ArraySize(gLow); if(c<=0||c>=n) return false;
+   double l=gLow[c];
+   for(int k=1;k<=InpPivotLen;k++){
+      if(c+k>=n||c-k<0) return false;
+      if(l>=gLow[c+k]||l>=gLow[c-k]) return false;
+   }
+   return true;
+}
+
+// inducement / flipzone finder inside the anchor box (mid of the deepest inside bar)
+double Sym_FindInduc(int anchorShift,double aHigh,double aLow){
+   double best=0.0; int bestDist=-1;
+   if(anchorShift>0){
+      for(int s=anchorShift-1; s>=0 && s>=anchorShift-InpSymInducLook; s--){
+         if(gHigh[s]<aHigh && gLow[s]>aLow){
+            int d=MathAbs(anchorShift-s);
+            if(bestDist<0||d<bestDist){ bestDist=d; best=(gHigh[s]+gLow[s])*0.5; }
+         }
+      }
+   }
+   return (bestDist>=0?best:0.0);
+}
+
+void Sym_ResetZones(){
+   sym_longInducPrice=0.0; sym_longInducLow=0.0; sym_longInducHigh=0.0;
+   sym_shortInducPrice=0.0; sym_shortInducLow=0.0; sym_shortInducHigh=0.0;
+   sym_longPreConvSeen=false; sym_shortPreConvSeen=false;
+   sym_longOuterBreachSeen=false; sym_shortOuterBreachSeen=false;
+}
+
+void Sym_UpdatePhaseEngine(){
+   int bars=ArraySize(gClose); if(bars<=(2*InpPivotLen+5)) return;
+   int s=1; double closeNow=gClose[s]; double atrRef=Sym_ATR(s);
+   int center=InpPivotLen+1; int pivotDir=0; double pivotPrice=0.0; int pivotShift=-1;
+   if(center<bars-InpPivotLen){
+      if(Sym_PivotHigh(center)){ pivotDir=1; pivotPrice=gHigh[center]; pivotShift=center; }
+      else if(Sym_PivotLow(center)){ pivotDir=-1; pivotPrice=gLow[center]; pivotShift=center; }
+   }
+   // SHORT impulse: last high -> new low
+   if(pivotDir==-1 && sym_lastPivotDir==1){
+      double r=sym_lastPivotPrice-pivotPrice;
+      if(r>atrRef*InpSymImpulseAtr){
+         sym_mode=-1; sym_anchorHigh=sym_lastPivotPrice; sym_anchorHighShift=sym_lastPivotShift;
+         sym_anchorLow=pivotPrice; sym_anchorLowShift=pivotShift;
+         sym_phaseShort=1; sym_phaseLong=0; Sym_ResetZones();
+         double lvl=Sym_FindInduc(sym_anchorHighShift,sym_anchorHigh,sym_anchorLow);
+         if(lvl>0.0){ sym_shortInducPrice=lvl; sym_shortInducLow=lvl-atrRef*InpSymInducZoneATR; sym_shortInducHigh=lvl+atrRef*InpSymInducZoneATR; }
+      }
+   }
+   // LONG impulse: last low -> new high
+   else if(pivotDir==1 && sym_lastPivotDir==-1){
+      double r=pivotPrice-sym_lastPivotPrice;
+      if(r>atrRef*InpSymImpulseAtr){
+         sym_mode=1; sym_anchorLow=sym_lastPivotPrice; sym_anchorLowShift=sym_lastPivotShift;
+         sym_anchorHigh=pivotPrice; sym_anchorHighShift=pivotShift;
+         sym_phaseLong=1; sym_phaseShort=0; Sym_ResetZones();
+         double lvl=Sym_FindInduc(sym_anchorLowShift,sym_anchorHigh,sym_anchorLow);
+         if(lvl>0.0){ sym_longInducPrice=lvl; sym_longInducLow=lvl-atrRef*InpSymInducZoneATR; sym_longInducHigh=lvl+atrRef*InpSymInducZoneATR; }
+      }
+   }
+   // persist pivot history
+   if(pivotDir!=0){
+      sym_prevPivotPrice=sym_lastPivotPrice; sym_prevPivotShift=sym_lastPivotShift; sym_prevPivotDir=sym_lastPivotDir;
+      sym_lastPivotPrice=pivotPrice; sym_lastPivotShift=pivotShift; sym_lastPivotDir=pivotDir;
+   }
+   // impulse invalidation
+   if(sym_mode==-1 && closeNow>sym_anchorHigh){ sym_mode=0; sym_phaseShort=0; Sym_ResetZones(); }
+   if(sym_mode==1  && closeNow<sym_anchorLow ){ sym_mode=0; sym_phaseLong=0;  Sym_ResetZones(); }
+
+   int oldL=sym_phaseLong, oldS=sym_phaseShort;
+   // SHORT side phases
+   if(sym_mode!=-1) sym_phaseShort=0;
+   if(sym_mode==-1 && sym_anchorHighShift>=0 && sym_anchorLowShift>=0){
+      double imp=sym_anchorHigh-sym_anchorLow;
+      double retr=(imp>0.0)?(closeNow-sym_anchorLow)/imp:0.0;
+      double d=gClose[s]-gClose[s+1];
+      int ph;
+      if(retr>InpSymRetrMax||retr<0.0) ph=0;
+      else if(closeNow<=sym_anchorLow) ph=4;
+      else if(retr>=InpSymRetrMin) ph=(d>0.0?2:3);
+      else ph=1;
+      bool hasZone=(sym_shortInducLow!=0.0||sym_shortInducHigh!=0.0);
+      if(ph==3 && hasZone && closeNow<=sym_shortInducHigh) ph=2;
+      else if(ph==3) sym_shortPreConvSeen=true;
+      if(ph==4 && !sym_shortPreConvSeen) ph=2;
+      sym_phaseShort=ph;
+   }
+   // LONG side phases
+   if(sym_mode!=1) sym_phaseLong=0;
+   if(sym_mode==1 && sym_anchorHighShift>=0 && sym_anchorLowShift>=0){
+      double imp=sym_anchorHigh-sym_anchorLow;
+      double retr=(imp>0.0)?(sym_anchorHigh-closeNow)/imp:0.0;
+      double d=gClose[s]-gClose[s+1];
+      int ph;
+      if(retr>InpSymRetrMax||retr<0.0) ph=0;
+      else if(closeNow>=sym_anchorHigh) ph=4;
+      else if(retr>=InpSymRetrMin) ph=(d<0.0?2:3);
+      else ph=1;
+      bool hasZone=(sym_longInducLow!=0.0||sym_longInducHigh!=0.0);
+      if(ph==3 && hasZone && closeNow>=sym_longInducLow) ph=2;
+      else if(ph==3) sym_longPreConvSeen=true;
+      if(ph==4 && !sym_longPreConvSeen) ph=2;
+      sym_phaseLong=ph;
+   }
+   sym_prevPhaseLong=oldL; sym_prevPhaseShort=oldS;
+}
+
+void Sym_UpdateARC(){
+   sym_arcLong=0.0; sym_arcShort=0.0;
+   int bars=ArraySize(gClose); if(bars<10) return; int s=1;
+   if(sym_mode==1 && sym_anchorLowShift>=0 && sym_anchorHighShift>=0){
+      double imp=sym_anchorHigh-sym_anchorLow;
+      if(imp>0.0){ double tgt=sym_anchorLow+imp*InpSymArcExt;
+         double t=(double)(sym_anchorLowShift-s)/(double)InpSymArcHorizon; if(t<0.0)t=0.0; if(t>1.0)t=1.0;
+         sym_arcLong=sym_anchorLow+(tgt-sym_anchorLow)*MathPow(t,InpSymConvPower); }
+   }
+   if(sym_mode==-1 && sym_anchorLowShift>=0 && sym_anchorHighShift>=0){
+      double imp=sym_anchorHigh-sym_anchorLow;
+      if(imp>0.0){ double tgt=sym_anchorHigh-imp*InpSymArcExt;
+         double t=(double)(sym_anchorHighShift-s)/(double)InpSymArcHorizon; if(t<0.0)t=0.0; if(t>1.0)t=1.0;
+         sym_arcShort=sym_anchorHigh+(tgt-sym_anchorHigh)*MathPow(t,InpSymConvPower); }
+   }
+}
+
+
+
+//==================================================================
+// SYMPHONY ENTRIES — Phase 3 (full) + Phase 4 (breakout), routed through
+// the F16 decision/confluence/FU-anchor layer + snXperFX guards/risk/audit
+//==================================================================
+void Sym_TryEntry(int dir,string tag){
+   if(!TradingAllowed()) return;
+   if(CountPositions()>=InpMaxPositions) return;
+   if(IsDeadZone()) return;
+   if(InpEnforceDeadZone && !InSessionWindow() && InpRequireSessionWindow) return;
+   datetime bt=gTime[0];
+   if(dir==1  && sym_lastLongTradeTime==bt)  return;
+   if(dir==-1 && sym_lastShortTradeTime==bt) return;
+
+   double atr=Sym_ATR(1);
+   double entry=(dir==1)?SymbolInfoDouble(_Symbol,SYMBOL_ASK):SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   // PRECISE Symphony stop = anchor +/- ATR*0.25
+   double anchor=(dir==1)?sym_anchorLow:sym_anchorHigh;
+   // F16 FU detector picks WHICH precise structure the stop is anchored to
+   if(InpSymUseF16 && InpF16Enable && InpF16AnchorPOI){
+      double aLo=MathMin(sym_anchorLow,sym_anchorHigh), aHi=MathMax(sym_anchorLow,sym_anchorHigh);
+      anchor=F16_AnchorPrecision(dir,aLo,aHi,anchor);
+   }
+   double sl=(dir==1)?(anchor-atr*0.25):(anchor+atr*0.25);
+   if(!((dir==1 && entry>sl)||(dir==-1 && sl>entry))) return;
+
+   double riskPct=InpRiskPct;
+   // CONNECT to the F16 layer: confluence gate + decision veto/size/target
+   if(InpSymUseF16 && InpF16Enable){
+      if(InpF16Confluence && !F16_Confluent(dir)) return;
+      F16_Decision(dir);
+      if(g_f16decVeto){ Print("SYM F16 VETO ",tag," — ",g_f16decReason); return; }
+      if(InpF16SizeByOpp) riskPct=MathMax(0.05,riskPct*g_f16decSize);
+   }
+   if(g_reduceSizing) riskPct*=0.5;
+
+   double stopPips=MathAbs(entry-sl)/MathMax(PipSize(),1e-9);
+   if(stopPips<InpMinStopPips){ stopPips=InpMinStopPips; sl=(dir==1)?(entry-PipsToPrice(stopPips)):(entry+PipsToPrice(stopPips)); }
+   double eq=AccountInfoDouble(ACCOUNT_EQUITY); double riskUSD=eq*riskPct/100.0;
+   double lots=ComputeLots(riskUSD,stopPips); if(lots<=0.0) return;
+   double newRisk=stopPips*PipValuePerLot()*lots; double maxTotal=eq*InpMaxTotalRisk/100.0;
+   if(OpenRiskUSD()+newRisk>maxTotal){ double avail=maxTotal-OpenRiskUSD(); if(avail<=0.0)return; lots=ComputeLots(avail,stopPips); if(lots<=0.0)return; }
+
+   // TARGETS — ARC (Symphony) primary, F16 attractor as the extended runner
+   double arc=(dir==1)?sym_arcLong:sym_arcShort;
+   double tp1=(arc>0.0)?arc:(dir==1?entry+PipsToPrice(InpHardTPPips):entry-PipsToPrice(InpHardTPPips));
+   double tp2=tp1;
+   if(InpSymUseF16 && InpF16Enable && g_f16decTarget>0.0){
+      bool ahead=(dir==1)?(g_f16decTarget>entry):(g_f16decTarget<entry);
+      if(ahead) tp2=g_f16decTarget;
+   }
+   string cmt="SYM "+tag;
+   if(SendOrder(dir,lots,sl,0.0,cmt)){
+      AdoptPosition(dir,sl,tp1,tp2,0.0,anchor,stopPips,lots,riskPct,ENTRY_REFINED);
+      if(dir==1) sym_lastLongTradeTime=bt; else sym_lastShortTradeTime=bt;
+      Print("SYM ENTRY ",tag," @",DoubleToString(entry,_Digits)," SL ",DoubleToString(sl,_Digits),
+            " (",DoubleToString(stopPips,1),"p) lots ",DoubleToString(lots,2),
+            " phase ",(dir==1?sym_phaseLong:sym_phaseShort),
+            (g_f16poiAnchored?(" anchor "+F16_WtLabel(g_f16poiNodeWt)+" FU"):" anchor pivot"),
+            "  | F16 ",g_f16oppGrade," sz x",DoubleToString(g_f16decSize,2),
+            " arc ",DoubleToString(tp1,_Digits)," tgt ",DoubleToString(tp2,_Digits));
+   }
+}
+
+void Sym_ExecuteEntries(){
+   if(!InpSymEnable) return;
+   double atr=Sym_ATR(1); double cl=gClose[1];
+   bool L3=(sym_mode==1  && sym_phaseLong ==3);
+   bool L4=(sym_mode==1  && sym_phaseLong ==4);
+   bool S3=(sym_mode==-1 && sym_phaseShort==3);
+   bool S4=(sym_mode==-1 && sym_phaseShort==4);
+   if(L3) Sym_TryEntry(1,"P3 Long");
+   if(L4){ bool bo=(cl>sym_anchorHigh || cl>gHigh[2]+0.20*atr); if(bo) Sym_TryEntry(1,"P4 Long"); }
+   if(S3) Sym_TryEntry(-1,"P3 Short");
+   if(S4){ bool bo=(cl<sym_anchorLow  || cl<gLow[2]-0.20*atr);  if(bo) Sym_TryEntry(-1,"P4 Short"); }
+}
+
+
+
+//==================================================================
+// SYMPHONY EXITS — ARC exhaustion + institutional outer-band sweep +
+// phase-change-at-extreme composite (closes only SYM-tagged positions)
+//==================================================================
+void Sym_ManageExits(){
+   if(!InpSymEnable) return;
+   int bars=ArraySize(gClose); if(bars<=(2*InpPivotLen+5)) return;
+   double closeNow=gClose[1]; double atr=Sym_ATR(1);
+
+   bool arcExhaustLong  = (sym_mode==1  && sym_arcLong >0.0 && closeNow>=(sym_arcLong -InpSymArcTolATR*atr));
+   bool arcExhaustShort = (sym_mode==-1 && sym_arcShort>0.0 && closeNow<=(sym_arcShort+InpSymArcTolATR*atr));
+
+   double instLevelL=(sym_longInducPrice!=0.0?sym_longInducPrice:(sym_anchorHigh>0.0?sym_anchorHigh:0.0));
+   double innerTopL =(sym_longInducHigh>0.0?sym_longInducHigh:instLevelL);
+   double outerTopL =innerTopL+InpSymOuterBandATR*atr;
+   double instLevelS=(sym_shortInducPrice!=0.0?sym_shortInducPrice:(sym_anchorLow>0.0?sym_anchorLow:0.0));
+   double innerBotS =(sym_shortInducLow>0.0?sym_shortInducLow:instLevelS);
+   double outerBotS =innerBotS-InpSymOuterBandATR*atr;
+
+   if(sym_mode==1  && instLevelL>0.0 && closeNow>outerTopL) sym_longOuterBreachSeen=true;
+   if(sym_mode==-1 && instLevelS>0.0 && closeNow<outerBotS) sym_shortOuterBreachSeen=true;
+
+   bool phaseEndLong  = (sym_mode==1  && (sym_prevPhaseLong ==3||sym_prevPhaseLong ==4) && sym_phaseLong <=1);
+   bool phaseEndShort = (sym_mode==-1 && (sym_prevPhaseShort==3||sym_prevPhaseShort==4) && sym_phaseShort<=1);
+
+   bool exitLong=false, exitShort=false;
+   if(sym_mode==1 && arcExhaustLong && phaseEndLong){
+      bool ok=(instLevelL<=0.0) || (sym_longOuterBreachSeen && closeNow<innerTopL);
+      if(ok) exitLong=true;
+   }
+   if(sym_mode==-1 && arcExhaustShort && phaseEndShort){
+      bool ok=(instLevelS<=0.0) || (sym_shortOuterBreachSeen && closeNow>innerBotS);
+      if(ok) exitShort=true;
+   }
+   if(!exitLong && !exitShort) return;
+
+   int total=PositionsTotal();
+   for(int i=total-1;i>=0;i--){
+      ulong tk=PositionGetTicket(i); if(!PositionSelectByTicket(tk)) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol||PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      if(StringFind(PositionGetString(POSITION_COMMENT),"SYM")<0) continue;   // only Symphony-opened positions
+      long type=PositionGetInteger(POSITION_TYPE);
+      if(exitLong  && type==POSITION_TYPE_BUY)  ClosePositionFull(tk,"SYM ARC/PHASE EXIT");
+      if(exitShort && type==POSITION_TYPE_SELL) ClosePositionFull(tk,"SYM ARC/PHASE EXIT");
+   }
 }

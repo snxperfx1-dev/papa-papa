@@ -1528,8 +1528,7 @@ double GetDirectionFloatingPnL(int direction)
       long type = PositionGetInteger(POSITION_TYPE);
       if((type == POSITION_TYPE_BUY ? 1 : -1) != direction) continue;
       total += PositionGetDouble(POSITION_PROFIT)
-             + PositionGetDouble(POSITION_SWAP)
-             + PositionGetDouble(POSITION_COMMISSION);
+             + PositionGetDouble(POSITION_SWAP);
    }
    return total;
 }
@@ -1731,7 +1730,7 @@ void TrailStops(int direction)
          req.position = ticket;
          req.sl       = NormalizeDouble(newSL, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
          req.tp       = currentTP;
-         OrderSend(req, res);
+         if(!OrderSend(req, res)) Print("SYM trail SLTP failed ticket=",ticket," err=",GetLastError());
       }
    }
 }
@@ -1786,8 +1785,7 @@ void RunProfitLadderDirection(int direction, int &rungs)
       double entry = PositionGetDouble(POSITION_PRICE_OPEN);
       double sl    = PositionGetDouble(POSITION_SL);
       double pnl   = PositionGetDouble(POSITION_PROFIT)
-                   + PositionGetDouble(POSITION_SWAP)
-                   + PositionGetDouble(POSITION_COMMISSION);
+                   + PositionGetDouble(POSITION_SWAP);
       double distSL = (sl > 0.0) ? MathAbs(entry - sl) : 0.0;
       if(distSL < 1.0) distSL = atrFB;
       totalLots += lots;
@@ -2220,11 +2218,11 @@ void UpdateDashboard()
                      : "none (await major-zone reversal)") + nl;
    // fractal entry target: the rotated group reacts against this NEXT-up TF zone
    int pTF = g_cascadeDepth; if(pTF < 1) pTF = 1; if(pTF > 8) pTF = 8;
-   double pz = (g_cascadeDir==1) ? g_mtfDemand[pTF] : (g_cascadeDir==-1) ? g_mtfSupply[pTF] : 0.0;
-   double prm = (pz>0.0) ? MathAbs(Close[1]-pz)/MathMax(GetATR(1),1e-9) : 0.0;
+   double pzt = (g_cascadeDir==1) ? g_mtfDemand[pTF] : (g_cascadeDir==-1) ? g_mtfSupply[pTF] : 0.0;
+   double prm = (pzt>0.0) ? MathAbs(Close[1]-pzt)/MathMax(GetATR(1),1e-9) : 0.0;
    s += "ENTRY ZONE: [M1.." + (g_cascadeDepth>=1?g_mtfLbl[g_cascadeDepth-1]:"-") + "] -> " + g_mtfLbl[pTF] + " "
       + (g_cascadeDir==1?"demand":g_cascadeDir==-1?"supply":"-") + " "
-      + (pz>0.0? DoubleToString(pz,2)+" ("+DoubleToString(prm,1)+" ATR)":"-") + nl;
+      + (pzt>0.0? DoubleToString(pzt,2)+" ("+DoubleToString(prm,1)+" ATR)":"-") + nl;
    string rage = "ROT age: ";
    for(int ri = 0; ri < 9; ri++)
       rage += g_mtfLbl[ri] + " " + (g_mtfRotBar[ri] > 0 ? IntegerToString(g_barCount - g_mtfRotBar[ri]) : "-") + "  ";

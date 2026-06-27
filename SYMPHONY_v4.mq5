@@ -2002,19 +2002,20 @@ bool CurveAllowsShort()
    return true;
 }
 
-// FRACTAL entry zone: the rotated lower-TF group [M1..front] reacts against the NEXT
-// timeframe UP (front+1 = g_cascadeDepth). dir=+1 -> that parent's DEMAND to BUY from;
-// dir=-1 -> that parent's SUPPLY to SELL from. As the cascade climbs, the parent climbs
-// with it: [M1,M5]->M15, [M1,M5,M15]->M30, ... [H1,H4]->D1, [H1,H4,D1]->W1.
+// FRACTAL entry zone. The rotated group reacts against the NEXT TF up (parent =
+// g_cascadeDepth), but we accept the NEAREST in-direction zone from a low floor
+// (InpZoneFromTFIndex) up to that parent. So at a reversal it takes the parent
+// demand/supply, and inside a running trend it takes the shallow lower-TF pullback
+// the price actually reaches — instead of starving while price runs from the far zone.
 bool AtHigherTFZone(int dir, double px, double atr, int &tfOut, double &zoneOut)
 {
    tfOut = -1; zoneOut = 0.0;
-   int parent = g_cascadeDepth;                 // front index = depth-1, so parent = depth
-   if(parent < 1) parent = 1;
-   if(parent > 8) parent = 8;
-   int hi = parent + InpZoneOpenAhead; if(hi > 8) hi = 8;
+   int loZ = (InpZoneFromTFIndex < 0) ? 0 : (InpZoneFromTFIndex > 8 ? 8 : InpZoneFromTFIndex);
+   int hiZ = g_cascadeDepth + InpZoneOpenAhead;   // up to the parent (next-up) zone
+   if(hiZ > 8) hiZ = 8;
+   if(hiZ < loZ) hiZ = loZ;
    double bestD = 1e9;
-   for(int i = parent; i <= hi; i++)
+   for(int i = loZ; i <= hiZ; i++)
    {
       double z = (dir == 1) ? g_mtfDemand[i] : g_mtfSupply[i];
       if(z <= 0.0) continue;

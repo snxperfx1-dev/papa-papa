@@ -103,6 +103,7 @@ input bool   InpUseRotationExit   = true;   // EXIT: a lower-TF rotation against
 input double InpZoneApproachATR   = 1.0;    // price must be within this many ATR of the higher-TF S/D zone to enter
 input double InpZoneSLBufferATR   = 0.5;    // stop placed this many ATR beyond the zone
 input bool   InpRequireCleanRotation = false; // require a clean (bottom-led) cascade before entering
+input bool   InpRequirePhaseTrigger = true; // require a P3/P4 phase (timing) in the entry direction to fire
 // --- direction memory + cross-timeframe phase confluence ---
 input int    InpMTFConfirmBars    = 3;      // a TF's direction must confirm this many bars before it flips (anti-whipsaw)
 input bool   InpRequirePhaseConfluence = true; // entries must be nested under agreeing phases across timeframes
@@ -1175,6 +1176,32 @@ bool HigherTFSupports(int idx, int dir)
    return false;
 }
 
+// PHASE TRIGGER (the TIMING): a timeframe whose phase has transitioned into P3/P4 in
+// 'dir' — P3 = retracement complete (resumption), P4 = breakout/new extreme. This is
+// the firing event; the zone is WHERE and the cascade is the DIRECTION.
+bool PhaseTrigger(int dir)
+{
+   for(int i = 0; i < 8; i++)
+   {
+      bool active = (dir == 1) ? gTFEng[i].Lactive : gTFEng[i].Sactive;
+      int  ph     = (dir == 1) ? gTFEng[i].Lphase  : gTFEng[i].Sphase;
+      if(active && (ph == 3 || ph == 4)) return true;
+   }
+   return false;
+}
+// Did a P3/P4 transition happen THIS bar in 'dir' (phase just entered the 3/4 family)?
+bool PhaseJustTransitioned(int dir)
+{
+   for(int i = 0; i < 8; i++)
+   {
+      bool active = (dir == 1) ? gTFEng[i].Lactive : gTFEng[i].Sactive;
+      int  ph     = (dir == 1) ? gTFEng[i].Lphase     : gTFEng[i].Sphase;
+      int  pph    = (dir == 1) ? gTFEng[i].LprevPhase : gTFEng[i].SprevPhase;
+      if(active && ph >= 3 && pph < 3) return true;
+   }
+   return false;
+}
+
 //==================================================================
 // 11B. PER-TIMEFRAME STRUCTURE ENGINE  (P3/P4 on ALL curves)
 //   The same impulse -> phase 1-4 -> induc-zone machine the chart
@@ -1961,9 +1988,10 @@ void ExecuteTrading()
 
    int tf = -1; double zone = 0.0;
 
-   // BUY: confirmed bullish rotation + price AT a higher-TF DEMAND zone
+   // BUY: confirmed bullish rotation + price AT a higher-TF DEMAND zone + P3/P4 timing
    if(cdir == 1 && !blockLong && g_longLastEntryBar != g_barCount && CurveAllowsLong()
       && AtHigherTFZone(1, close, atr, tf, zone)
+      && (!InpRequirePhaseTrigger || PhaseTrigger(1))
       && (!InpRequirePhaseConfluence || PhaseConfluence(1) >= InpMinPhaseConfluence))
    {
       double entry = close;
@@ -1977,9 +2005,10 @@ void ExecuteTrading()
       }
    }
 
-   // SELL: confirmed bearish rotation + price AT a higher-TF SUPPLY zone
+   // SELL: confirmed bearish rotation + price AT a higher-TF SUPPLY zone + P3/P4 timing
    if(cdir == -1 && !blockShort && g_shortLastEntryBar != g_barCount && CurveAllowsShort()
       && AtHigherTFZone(-1, close, atr, tf, zone)
+      && (!InpRequirePhaseTrigger || PhaseTrigger(-1))
       && (!InpRequirePhaseConfluence || PhaseConfluence(-1) >= InpMinPhaseConfluence))
    {
       double entry = close;
